@@ -25,27 +25,40 @@ static void bbytes(Buf *o, const void *p, long n) { memcpy(o->b + o->n, p, n); o
 static void bstr(Buf *o, const char *s) { bbytes(o, s, (long)strlen(s)); }
 static void bfill11(Buf *o, int n) { for (int i = 0; i < n; i++) o->b[o->n++] = 0x11; }
 
+static void chunk(Buf *o, uint32_t magic, const Buf *payload);
 static void physics_attr_test(void) {
-    unsigned char d[0x1000]={0};
+    unsigned char d[N2_GLOBAL_CAR_STRIDE]={0};
     const char *path="CARS\\TESTCAR\\GEOMETRY.BIN";
-    memcpy(d+0x40,path,strlen(path));
-    long b=0;float f;int gears=5;
-#define PAF(off,val) do{f=(val);memcpy(d+b+(off),&f,4);}while(0)
+    memcpy(d,"TESTCAR",8);memcpy(d+0x40,path,strlen(path));
+    float f;int gears=5;
+#define PAF(off,val) do{f=(val);memcpy(d+(off),&f,4);}while(0)
     PAF(0x220,1.25f);PAF(0x300,800);PAF(0x304,6500);PAF(0x308,7000);
+    PAF(0x224,4);PAF(0x228,2);PAF(0x22c,1.5f);
+    PAF(0x230,1.25f*(4+2.25f)/12);PAF(0x244,1.25f*(16+2.25f)/12);
+    PAF(0x258,1.25f*20/12);
+    for(uint32_t k=0;k<4;k++) {
+        int w=0x120+0x30*k;
+        PAF(w,k<2?1.2f:-1.3f);PAF(w+4,k%2?-.8f:.8f);
+        PAF(w+0x10,k<2?.3f:.32f);PAF(w+0x14,k<2?.2f:.24f);
+        memcpy(d+w+0x18,&k,4);
+    }
     for(int i=0;i<9;i++)PAF(0x310+i*4,.12f+i*.01f);
     PAF(0x380,1.15f);PAF(0x2d0,1.0f);
     const int gb[4]={0x2c0,0x460,0x4a0,0x4e0};
     const int gain[4]={0x530,0x570,0x5b0,0x5f0};
     for(int level=0;level<4;level++) {
         PAF(gb[level]+8,4.1f-level*.1f);PAF(gb[level]+0x20,-3.1f);
-        memcpy(d+b+gb[level]+0x18,&gears,4);
+        memcpy(d+gb[level]+0x18,&gears,4);
         for(int i=0;i<5;i++)PAF(gb[level]+0x28+i*4,3.2f/(i+1));
         for(int i=0;i<9;i++)PAF(gain[level]+i*4,level*.01f*(i+1));
     }
 #undef PAF
-    N2PhysicsAttr a;
-    chk("GLOBALB stock physics record decodes by exact car path",
-        n2_global_physics_attr(d,sizeof d,"TESTCAR",&a));
+    Buf table={0},nested={0},root={0};
+    bfill11(&table,8);bbytes(&table,d,sizeof d);
+    chunk(&nested,0x00034600u,&table);chunk(&root,0x80000001u,&nested);
+    N2PhysicsAttr a;N2CarShapeAttr shape;N2WheelAttr wheel;
+    chk("nested GLOBALB car table decodes stock powertrain",
+        n2_global_physics_attr(root.b,root.n,"TESTCAR",&a));
     chk("mass, rpm, drivetrain and steering preserve source values",
         fabsf(a.mass_tonnes-1.25f)<1e-6f&&fabsf(a.idle_rpm-800)<1e-6f&&
         fabsf(a.limiter_rpm-7000)<1e-6f&&fabsf(a.rear_drive-1)<1e-6f&&
@@ -55,9 +68,78 @@ static void physics_attr_test(void) {
         fabsf(a.gearbox[0].forward[0]-3.2f)<1e-6f&&
         fabsf(a.gearbox[3].final_drive-3.8f)<1e-6f&&
         fabsf(a.torque_gain[3][8]-.27f)<1e-6f);
-    memcpy(d+0x900,path,strlen(path));
-    chk("duplicate car paths are rejected instead of choosing a record",
-        !n2_global_physics_attr(d,sizeof d,"TESTCAR",&a));
+    chk("all wheel dimensions and inertia retain source values and offset",
+        n2_global_car_shape(root.b,root.n,"TESTCAR",&shape)&&shape.record_offset==24&&
+        shape.body[0]==4&&shape.body[1]==2&&shape.body[2]==1.5f&&
+        fabsf(shape.inertia[2]-1.25f*20/12)<1e-6f&&
+        shape.wheel[0].radius==.3f&&shape.wheel[3].radius==.32f&&
+        shape.wheel[0].width==.2f&&shape.wheel[3].width==.24f&&
+        shape.wheel[1].y==-.8f&&shape.wheel[2].x==-1.3f);
+    chk("legacy axle reader retains its accepted profile",
+        n2_global_wheel_attr(root.b,root.n,"TESTCAR",&wheel)&&
+        wheel.front_axle==1.2f&&wheel.rear_axle==-1.3f&&wheel.front_track==1.6f);
+    Buf valid=root,decoy={0};bstr(&decoy,path);bu32(&decoy,0);
+    chunk(&root,42,&decoy);
+    chk("matching path in an unrelated leaf cannot override the table",
+        n2_global_car_record(root.b,root.n,"TESTCAR")==24);
+    chk("a raw path blob is not a GLOBALB car table",
+        n2_global_car_record(d,sizeof d,"TESTCAR")==-1);
+    root=valid;chunk(&root,0x00034600u,&table);
+    chk("duplicate car tables are rejected",n2_global_car_record(root.b,root.n,"TESTCAR")==-1);
+    bbytes(&table,d,sizeof d);root.n=0;chunk(&root,0x00034600u,&table);
+    chk("duplicate records in one table are rejected",
+        n2_global_car_record(root.b,root.n,"TESTCAR")==-1);
+    root=valid;root.b[16]=0;
+    chk("invalid table filler is rejected",n2_global_car_record(root.b,root.n,"TESTCAR")==-1);
+    table.n=8+sizeof d;bu32(&table,0);root.n=0;chunk(&root,0x00034600u,&table);
+    chk("partial trailing record is rejected",n2_global_car_record(root.b,root.n,"TESTCAR")==-1);
+    int truncated=1;
+    for(long len=0;len<valid.n;len++)
+        if(n2_global_car_record(valid.b,len,"TESTCAR")>=0)truncated=0;
+    chk("every truncated prefix is rejected",truncated);
+    root=valid;memset(root.b+24,'A',32);
+    chk("unterminated record name is rejected",n2_global_car_record(root.b,root.n,"TESTCAR")==-1);
+    root=valid;root.b[24+0x40]='X';
+    chk("record name/path mismatch is rejected",n2_global_car_record(root.b,root.n,"TESTCAR")==-1);
+    root=valid;f=NAN;memcpy(root.b+24+0x130,&f,4);
+    N2CarShapeAttr previous=shape;
+    chk("nonfinite wheel data fails without publishing partial output",
+        !n2_global_car_shape(root.b,root.n,"TESTCAR",&shape)&&!memcmp(&shape,&previous,sizeof shape));
+    root=valid;root.b[24+0x138]=3;
+    chk("wrong wheel index is rejected",!n2_global_car_shape(root.b,root.n,"TESTCAR",&shape));
+    root=valid;f=4.2f;memcpy(root.b+24+0x120,&f,4);
+    chk("large source axle is reportable without relaxing live wheel bounds",
+        n2_global_car_shape(root.b,root.n,"TESTCAR",&shape)&&
+        shape.wheel[0].x==4.2f&&!n2_global_wheel_attr(root.b,root.n,"TESTCAR",&wheel));
+}
+
+/* Optional local-data check: ./build/car_material_test ../GLOBAL/GLOBALB.BUN.
+ * Assets remain external; every discovered record is checked, including traffic
+ * and records without installed geometry. Failure contributes to the exit code. */
+static void real_car_table_test(const char *file) {
+    long len=0;unsigned char *d=n2_read_file(file,&len);N2GlobalCarTable table;
+    int valid=d&&n2_global_car_table(d,len,&table);
+    chk("local GLOBALB contains one structurally valid car table",valid);
+    if(!valid){free(d);return;}
+    int count=0;
+    for(long at=table.beg;at<table.end;at+=N2_GLOBAL_CAR_STRIDE) {
+        char name[33];memcpy(name,d+at,32);name[32]=0;
+        N2CarShapeAttr a;N2PhysicsAttr p;
+        int ok=n2_global_car_shape(d,len,name,&a)&&a.record_offset==at&&
+               n2_global_physics_attr(d,len,name,&p)&&p.mass_tonnes==a.mass_tonnes;
+        if(ok) {
+            for(int k=0;k<3;k++) {
+                float b=a.body[(k+1)%3],c=a.body[(k+2)%3];
+                float expected=a.mass_tonnes*(b*b+c*c)/12;
+                if(fabsf(a.inertia[k]-expected)>expected*1e-5f)ok=0;
+            }
+            for(int k=0;k<4;k+=2)
+                if(a.wheel[k].x!=a.wheel[k+1].x || a.wheel[k].y!=-a.wheel[k+1].y)ok=0;
+        }
+        char what[100];snprintf(what,sizeof what,"source %s: offset, mass, inertia and wheel mirrors",name);
+        chk(what,ok);count++;
+    }
+    printf("  local GLOBALB records checked: %d\n",count);free(d);
 }
 
 /* Wrap `payload` (already-built bytes) as one chunk: magic, size, payload. */
@@ -1569,8 +1651,9 @@ static void recursive_chunks_test(void) {
     n2_free_scene(&wrapped);
 }
 
-int main(void) {
+int main(int argc,char **argv) {
     physics_attr_test();
+    if(argc>1)real_car_table_test(argv[1]);
     recursive_chunks_test();
     authored_normals_test();
     stock_attachment_and_trim_test();

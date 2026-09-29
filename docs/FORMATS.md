@@ -1012,9 +1012,13 @@ unrelated systems; do not describe the entire file as one flat AttribSys stream.
 
 ### Per-car geometry anchor
 
-**PROVEN.** The ASCII path `CARS\\<NAME>\\GEOMETRY.BIN` occurs exactly once for
-each sampled drivable car. The surrounding per-car table repeats on a 2,192-byte
-stride. A wheel block begins 0x40 bytes before the path anchor:
+The shared bounded chunk walker locates one `0x00034600` table, including inside
+nested containers. Its payload starts with eight `0x11` bytes followed by
+2,192-byte records (46 in the local dataset). Each record has a bounded name
+at `+0x00` and matching geometry path at `+0x40`.
+`n2_global_car_record` rejects malformed framing, partial records, invalid
+names/paths, multiple tables and duplicate requested records. Matching strings
+in unrelated payloads are ignored; this is not a whole-file string search.
 
 | offset from `anchor - 0x40` | type | meaning |
 |---:|---|---|
@@ -1029,6 +1033,33 @@ and track dimensions across the sampled fleet. `n2_global_wheel_attr` accepts
 the record only after conservative plausibility bounds; otherwise the caller
 falls back to measurements derived from that car's geometry.
 
+### Source dimensions and inertia
+
+`n2_global_car_shape` exposes the following without changing live handling or
+wheel placement. Values must be finite, dimensions/inertia positive, and wheel
+indices must match source order. The returned record offset provides provenance.
+
+| record offset | type | meaning |
+|---:|---|---|
+| `+0x220` | `f32` | mass, interpreted as tonnes |
+| `+0x224..+0x22c` | `3*f32` | physical body L/W/H, metres |
+| `+0x230`, `+0x244`, `+0x258` | `f32` each | Ixx/Iyy/Izz, tonne·m² |
+| `+0x120 + 0x30*k` | `2*f32` | wheel X/Y, metres, k=0..3 |
+| wheel `+0x10`, `+0x14` | `f32` each | tyre radius and width, metres |
+| wheel `+0x18` | `u32` | source wheel index |
+
+Across all 46 local records, inertia matches the solid-box relation
+`Ixx = mass*(W²+H²)/12` and cyclic permutations. These physical dimensions are
+not render bounding boxes: fourteen traffic records share generic mass/body
+values. The BUS source axle is reportable here but still exceeds the existing
+live axle reader's bounds and therefore retains its geometry fallback.
+
+`--vehicle-compare A B` and `--fleet-census` print the source record offset,
+mass, dimensions, inertia and all four tyre sizes alongside existing results.
+`make car-material-test` covers synthetic/malformed tables; optionally run
+`./build/car_material_test ../GLOBAL/GLOBALB.BUN` to check every local source
+record's inertia and wheel mirroring without committing game assets.
+
 ### Stock and upgraded powertrain fields
 
 The following offsets are relative to the 2,192-byte car record and are
@@ -1042,15 +1073,17 @@ validated before runtime use:
 | gearbox `+0x10` | `f32` | rear-drive fraction (stock block) |
 | gearbox `+0x18` | `u32` | forward gear count |
 | gearbox `+0x20..+0x3c` | `8*f32` | reverse, neutral and six forward ratios |
-| `+0x300..+0x308` | `3*f32` | idle, redline and limiter RPM |
-| `+0x310..+0x330` | `9*f32` | stock torque curve, kN·m |
-| `+0x380` | `f32` | steering-response ratio |
-| `+0x530`, `+0x570`, `+0x5b0`, `+0x5f0` | `9*f32` each | four torque-gain curves, kN·m |
+| `+0x300..+0x308` | `3*f32` | idle and two RPM thresholds (redline/limiter labels provisional) |
+| `+0x310..+0x330` | `9*f32` | stock torque samples, interpreted as kN·m |
+| `+0x380` | `f32` | currently used as steering response; meaning unverified |
+| `+0x530`, `+0x570`, `+0x5b0`, `+0x5f0` | `9*f32` each | master gain curve and three upgrade curves |
 
-The torque points span idle to limiter in eight equal intervals. Source evidence
-supports the four gearbox levels directly. The gain curves form a consistent
-upgrade ladder, but their exact division among the separately sold engine, ECU
-and induction products is not yet proven, so OpenUG2 exposes them as power
+The current mapping assumes torque points span idle to limiter in eight equal
+intervals; the unit and sample domain remain unverified. The master gain curve
+equals the third upgrade curve; the first two are 0.34 and 0.68 times it in the
+local data. Source evidence supports four gearbox blocks directly. The gain
+curves form a consistent upgrade ladder, but their exact division among the
+separately sold engine, ECU and induction products is not yet proven, so OpenUG2 exposes them as power
 levels rather than inventing category-specific percentages. Brake, tyre and
 suspension upgrade fields remain undecoded.
 

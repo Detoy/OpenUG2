@@ -1010,6 +1010,24 @@ static PhysVehicle g_vehicle = { 1, 1, 1, 1, 1, 1 };   /* M121: this car */
 static N2PhysicsAttr g_vehicle_source;
 static int g_vehicle_source_valid;
 
+/* Diagnostic only: physical source dimensions are not visual mesh bounds.
+   Traffic records may share generic values; do not infer model-specific tuning. */
+static int print_car_source(const unsigned char *global,long len,const char *name) {
+    N2CarShapeAttr a;N2WheelAttr axles;
+    if(!n2_global_car_shape(global,len,name,&a)) {
+        printf("    source %-14s dimensions/inertia unavailable or invalid\n",name);
+        return 0;
+    }
+    printf("    source %-14s chunk=0x00034600 record=0x%lx mass=%.4f t "
+           "body=%.4f/%.4f/%.4f m inertia=%.5f/%.5f/%.5f t*m^2 axles=%s\n",
+           name,a.record_offset,a.mass_tonnes,a.body[0],a.body[1],a.body[2],
+           a.inertia[0],a.inertia[1],a.inertia[2],
+           n2_global_wheel_attr(global,len,name,&axles)?"source":"geometry-fallback");
+    for(int k=0;k<4;k++)printf("      wheel[%d] x=%.4f y=%.4f radius=%.4f width=%.4f m\n",
+        k,a.wheel[k].x,a.wheel[k].y,a.wheel[k].radius,a.wheel[k].width);
+    return 1;
+}
+
 static float source_peak_kw(const N2PhysicsAttr *a,int level) {
     float peak=0;level=level<0?0:level>3?3:level;
     for(int i=0;i<9;i++) {
@@ -2308,6 +2326,7 @@ int main(int argc, char **argv) {
                        "pitch %.4f roll %.4f\n", pv[c].accel, pv[c].brake,
                        pv[c].steer, pv[c].lat, pv[c].pitch_load, pv[c].roll_load);
                 printf("             source %s\n",sourced?"GLOBALB powertrain":"geometry fallback");
+                print_car_source(pg,pgl,nmv[c]);
                 if(sourced) {
                     printf("             power kW stock/L1/L2/L3");
                     for(int level=0;level<4;level++)printf(" %.1f",source_peak_kw(&pa,level));
@@ -2355,7 +2374,7 @@ int main(int argc, char **argv) {
         static char cl[FC_MAXCARS][64]; int sel2 = 0;
         int nc = res_list_cars(dataroot, cl, FC_MAXCARS, "", &sel2);
         long pgl=0;unsigned char *pg=load_global_car_data(dataroot,&pgl);
-        int physics_records=0;
+        int physics_records=0,shape_records=0;
         printf("MILESTONE: 121  fleet geometry census  (%d cars)\n", nc);
         printf("  %-14s %7s %7s %7s %9s %7s %7s %8s %8s\n", "car", "len", "wid", "hgt",
                "volume", "wheelR", "wheelW", "axleWB", "trackF");
@@ -2380,6 +2399,7 @@ int main(int argc, char **argv) {
                 physics_records += n2_global_physics_attr(pg,pgl,cl[i],&pa);
                 printf("  %-14s %7.3f %7.3f %7.3f %9.3f %7.3f %7.3f %8.3f %8.3f\n",
                        cl[i], L, W, H, L*W*H, cp.wheel_r, cp.wheel_w, wb, wc.front_track);
+                shape_records+=print_car_source(pg,pgl,cl[i]);
                 vol[n] = L*W*H; wbv[n] = wb; trk[n] = wc.front_track; twd[n] = cp.wheel_w; n++;
             }
             for (int k = 0; k < cs.count; k++) {
@@ -2397,6 +2417,8 @@ int main(int argc, char **argv) {
             }
         }
         printf("  GLOBALB powertrain/upgrade records %d/%d\n",physics_records,nc);
+        printf("  GLOBALB dimensions/inertia records %d/%d (diagnostic; traffic values may be shared)\n",
+               shape_records,nc);
         free(pg);
         return 0;
     }
