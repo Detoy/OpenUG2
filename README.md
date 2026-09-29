@@ -199,9 +199,9 @@ builds compile the panel out entirely, so none of this is reachable there —
 | **Modification** | The vehicle shop surface. Live car selector (swaps the vehicle without restarting the world or losing your pose) plus colour-coded Underground 2 shop subtabs. |
 | **Vehicle Diagnostics** | Per-car wheel stance (axle, track, ride, body lowering), live handling readouts, engine-cover and car-part inspection, mesh inspector, wheel spin/steer demo. |
 | **Lighting & Environment** | Night mode, headlight beam preview, beam pitch/reach/intensity, lens opacity, headlight shadows, street/district flare size and brightness, chase-camera distance/height/stiffness, ambient/diffuse/fog. |
-| **World & Entities** | Loaded track selector, scenery semantics census, nearby world chunks, decoded `ZCV_`/`ZCS_` entity definitions, UV checker, HUD toggle. |
+| **World & Entities** | Live traffic density (0–16 cars, default 4), active traffic/racer counts, loaded track selector, scenery semantics census, nearby world chunks, decoded `ZCV_`/`ZCS_` entity definitions, UV checker, HUD toggle. |
 | **Placement Marks** | Report a misplaced object by driving to it. Live probe readout (world XYZ, the ground selector's surface height and category, the covering chunk's asset name, district), then `F9` marks the defect and `F10` marks where it should be. Marks carry a note, list colour-coded, and go to the clipboard or `placement_marks.txt` — and every mark is echoed to stdout, so nothing is lost if the session ends. |
-| **Engine Telemetry** | FPS and frame time, draw calls, car/track mesh counts, active district, camera and car coordinates, heading and speed, freecam. |
+| **Engine Telemetry** | FPS and frame time, draw calls, car/track mesh counts, active district, camera and car coordinates, heading and speed, orbit camera. |
 | **Navigation & Races** | Top-down nav graph drawn from the authored route files, district colouring, right-click GPS routing, the shipped race-event catalog, and freeroam/race mode switching with a live race HUD. |
 
 The Modification subtabs follow the retail shop colours:
@@ -280,13 +280,13 @@ frontend; the asset-backed menu is documented in
 milestone.
 
 **Controls:** driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
-grip for drifts), `F` freecam (WASD move · hold right-mouse or arrows to look ·
-`E`/`Q` up/down · `Shift` faster), `L` high beam, `J` headlight flash (open-world
-racer invite), `N` nitro, **`1` developer menu** (the ImGui Master Inspector, in
+grip for drifts), hold **right mouse** and drag to orbit the car (`F` latches orbit), `L` high beam, `J` headlight flash
+(racer invitations are not implemented yet), `N` nitro, **`1` developer menu** (the ImGui Master Inspector, in
 `make debug` builds), `F6` cycle rim style
 (once per press), `K` cycle body kit, `Esc` quit. Cars
 collide and building contact is confirmed against source mesh faces before the
-car is pushed. `--shot out.png` renders one frame to a PNG and exits.
+car is pushed. The orbit camera stays above the car and retracts around scenery.
+`--shot out.png` renders one frame to a PNG and exits.
 
 The default resolution is **1920×1080**. Screenshots and visual race/drive audits
 render in a hidden, fixed-size GL window, so desktop window limits do not shrink

@@ -1051,6 +1051,7 @@ Prefer the narrowest diagnostic that observes the production path:
 | vinyl catalogue | `./build/vinyl_census DATAROOT CAR --all`, or `--vinyl list` |
 | texture detail (anisotropy) | `--texture-detail N`, or the live slider in *Lighting & Environment* |
 | texture rejection census | `--tex-audit` (one `TEXFAIL` line per discarded texture, with the owning mesh) |
+| player HUD | `--hud` (dial/minimap/nav/status), `--hud-preview` (labelled sample values), `--hud-dest X,Y` (headless destination) |
 | wrong picture on a mesh | `OPENUG2_SLOT_PROBE=<object name>` prints each submesh's texture slot and whether the bundle supplies it; `make texkey-probe && ./build/texkey_probe DATAROOT TRACK KEYHEX` then says what that key actually is (set `N2_PROBE_DIR` to dump the pixels) |
 | panorama classification | `--vista-census` (add `0` to list every object, not just the giants), `--lod-census`, `tools/impostor_atlas_census.py` |
 
@@ -1430,3 +1431,96 @@ one-frame residency tear.
 
 When one of these reappears, reuse its existing invariant and test. Do not add a
 second workaround in the camera, shader or spawn code.
+
+## Player HUD (`--hud`)
+
+```bash
+./nfsu2 .. --world2 --track STREAML4RA --hud
+```
+
+Opt-in and independent of the `1` developer-overlay toggle. It **replaces** the
+old diagnostic overlay rather than stacking on it, and without the flag the
+rendered frame is byte-identical to a build without the module.
+
+Art is decoded from the shipped packs with the existing TPK reader; nothing is
+copied into the repo. `GLOBAL/InGameCommon.bun` supplies the minimap, Cingular
+and NOS sprites, `GLOBAL/InGameRace.bun` the tachometer arc, and
+`GLOBAL/HUD_CustomTextures_ALL.bin` the dial faces (`TACH_FILL_CUSTOM_00..10`;
+the per-style `HUD_CustomTextures_00..10.bin` files hold no TPK records).
+
+Two things are measured at load rather than assumed:
+
+* **Dial geometry.** The needle pivot is a least-squares circle fit over
+  `TACH_NOS_ALPHA`'s opaque texels, with the sweep taken from the largest
+  angular gap. The shipped arc is centred at (0.373, 0.054) of the art width
+  with radius 0.303 and sweeps 181°→29° — it is neither a semicircle nor
+  centred on the art, so assuming either puts the needle outside the dial.
+* **Art usability.** A record can decode to garbage; `ARROW_MARKERA` does.
+  `hud_art_run_fraction` measures horizontal colour coherence — every usable
+  sprite scores 0.719–0.996, that record scores 0.192 — and anything under
+  `HUD_ART_RUN_MIN` is refused and named by `hud_missing()`. The navigation
+  arrow then falls back to a drawn chevron, which is deliberately plain so it
+  is not mistaken for retail art.
+
+### What is real, and what is not
+
+`HudState`'s availability flags carry this; the HUD draws an explicit empty
+state rather than a plausible number.
+
+| readout | source |
+|---|---|
+| speed | `PHYS_KMH(speed)` — real |
+| RPM, gear | `g_engine.target_rpm` / `eng_gearbox_step` — **provisional**: this is the virtual *audio* gearbox, not a recovered drivetrain |
+| nitrous | `nitro_active` — real but **binary**; no tank or depletion system exists, so the bar is an on/off indicator |
+| turbo/boost | **absent** — no boost pressure anywhere in `src/`, and no gauge |
+| money | **absent** — no career economy; reads `BANK N/A`, and is hidden entirely during a race |
+| lap / progress | the authored event tracker (`World.city.race`: gates, laps), falling back to the legacy circuit-AI path |
+
+A race is `race.active`, **not** `ai_race`: an armed event needs no AI
+opponents, and reading `ai_race` alone leaves the HUD in free-roam dress during
+a real event. Sprints show gate progress; printing laps there would be a
+fabricated circuit readout. `--hud-preview` fills the absent readouts with
+sample values *and* paints a `PREVIEW SAMPLE VALUES` banner.
+
+### Map placement
+
+There is no whole-city track map: `TRACKS/TRACKMAP<id>.BIN` is one 512×512
+texture per event with no world-coordinate metadata. The minimap therefore
+draws from world coordinates the engine already loads — the nav graph in free
+roam, the event route in a race — so placement is per-track measured data, not
+a fit to one district. `MINIMAP_MASK` is the panel disc (not a vignette) and
+`MINIMAP_BORDER` is one **quadrant** of the ring, drawn four times rotated.
+
+Destination selection is a left-click on the minimap (`hud_map_pick` inverts
+the same transform the frame drew); `G` clears guidance. The arrow's bearing is
+to the next node **along the solved route**, never the straight line to the
+target, and an unreachable destination leaves the route empty so nothing is
+drawn. `make hud-test` covers the angle wrap, the map round-trip, aspect
+invariance, the sprint/lap rule, money visibility and the art gate.
+
+### Fitted parts
+
+A part that is not fitted is **removed from the cluster**, not drawn inert, so
+a stock car shows a clean tachometer and nothing else. `hud_shows_nos()` gates
+the N2O bar and `HudState.have_turbo` is the matching switch for a boost dial.
+
+What the engine can actually report: the performance shop models four power
+curves and four transmissions from GLOBALB and nothing more — its own panel
+says turbo mapping and nitrous "remain pending". So today nitrous counts as
+fitted (the engine grants every car a working boost on `N`, which really does
+raise top speed) and a turbo never does.
+
+The standard HUD has **no turbo gauge at all**. The only turbo art in the game
+is `DRAG_TURBO_BACKING/LINES/NEEDLE` in `GLOBAL/InGameDrag.bun`, which belongs
+to the drag HUD and is out of scope here; `InGameDrag.bun` also holds the full
+numbered drag tachometer (`DRAG_RPM_BACKING`, `DRAG_RPM_{7000..10000}_LINES`,
+`DRAG_RPM_NEEDLE`) for whoever builds that mode. Note those records place their
+circle centre OUTSIDE the texture — `DRAG_RPM_8000_LINES` sits 1.336 widths to
+the right of its own left edge — so they cannot be positioned by eye.
+
+`--hud-fitted nos,turbo|none` overrides fitment for review. It changes what is
+drawn, never a telemetry value.
+
+One cosmetic limitation: the `N2O` legend is painted into `TACH_NOS_ALPHA`,
+which is also the rev-counter arc, so the word remains on the dial even with
+nitrous unfitted. Separating them needs art that does not ship.

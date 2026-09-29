@@ -167,6 +167,30 @@ static void test_rail_uses_body_footprint(void) {
 #endif
 }
 
+static void test_sloping_curb_is_not_a_rail(void) {
+    /* A ten-centimetre curb rising a metre over twenty metres has >.75 m
+       total Z span, but remains a drivable curb. A tall rail on the same
+       grade must still block. Rotate and reverse winding, without names. */
+    const float bb[]={-1.97f,-.94f,0,1.97f,.94f,1.37f};
+    for(int turn=0;turn<3;turn++)for(int winding=0;winding<2;winding++)
+    for(int tall=0;tall<2;tall++) {
+        float height=tall?1.2f:.1f,c=cosf(turn*.71f),sn=sinf(turn*.71f);
+        float v[20]={0};uint16_t idx[]={0,1,2,0,2,3};
+        float local[][3]={{0,0,0},{20,0,1},{20,0,1+height},{0,0,height}};
+        for(int k=0;k<4;k++) {
+            v[k*5]=c*local[k][0];v[k*5+1]=sn*local[k][0];v[k*5+2]=local[k][2];
+        }
+        if(winding)for(int t=0;t<6;t+=3){uint16_t tmp=idx[t];idx[t]=idx[t+2];idx[t+2]=tmp;}
+        N2Mesh mesh={.verts=v,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD};
+        N2Scene scene={&mesh,1,1};
+        for(int t=0;t<6;t+=3)
+            assert(fabsf(phys_wall_face_height(v+idx[t]*5,v+idx[t+1]*5,v+idx[t+2]*5)-height)<.001f);
+        float p[]={10*c-.5f*sn,10*sn+.5f*c,.5f},vel[]={sn,-c};
+        int hit=collide_body_mesh_wall(p,vel,turn*.71f,bb,.55f,1.9f,&scene,0,.75f,2.5f,NULL);
+        assert(hit==tall);
+    }
+}
+
 static void test_wall_contact_uses_car_height(void) {
     /* Vertical triangular wall: in its local (y,z) plane the vertices are
      * (0,0), (10,10), (0,10). At z=0.2..2.1 the actual face ends at y=2.1,
@@ -230,7 +254,86 @@ static void test_five_vertex_height_slice(void) {
     assert(!cw_probe_contact(&scene,0,0.5f,8.0f,1.0f,1.0f,1.0f));
 }
 
+static void test_authored_barriers_and_baked_walls(void) {
+    const char *guards[]={"XO_PATHGUARDA_1A_00","XO_PATHGUARDC_1A_00",
+                          "XO_TRACKBARRIERB_B_1A_00","XO_ROADBARRIERB_1A_00",
+                          "XO_FENCEF_1A_00","XO_CONSTWALLA_1A_00"};
+    N2Scene s;N2Mesh m;float verts[20]={0},obst[1][4],obz[1][2];
+    uint16_t idx[6];int src[1];
+    const float bb[]={-1.97f,-.94f,0,1.97f,.94f,1.37f};
+    for(unsigned i=0;i<sizeof guards/sizeof guards[0];i++) {
+        make_vertical_panel(&s,&m,verts,idx,n2_scen_class(guards[i]),.65f);
+        snprintf(m.sname,sizeof m.sname,"%s",guards[i]);
+        assert(collect_one(&s,obst,src,obz)==1);
+        float p[]={1.8f,0,0},v[]={-1,.2f};
+        assert(collide_body_walls(p,v,0,bb,obst,obz,1,.1f,1.47f,&s,src,NULL,0));
+        assert(p[0]>=1.969f && fabsf(v[0])<1e-5f && fabsf(v[1]-.2f)<1e-5f);
+    }
+    make_vertical_panel(&s,&m,verts,idx,N2_SC_TERRAIN,4.818f);
+    m.cat=N2_TERRAIN;strcpy(m.sname,"TRN_TEST_PROPSB_CHOP_ANY");
+    assert(collect_one(&s,obst,src,obz)==1);
+    float p[]={1.8f,0,0},v[]={-1,.2f};
+    assert(collide_body_walls(p,v,0,bb,obst,obz,1,.1f,1.47f,&s,src,NULL,0));
+    assert(p[0]>=1.969f && fabsf(v[0])<1e-5f && fabsf(v[1]-.2f)<1e-5f);
+    p[0]=1.8f;v[0]=-1;
+    assert(!collide_body_walls(p,v,0,bb,obst,obz,1,5,6.4f,&s,src,NULL,0));
+    /* A thin sloping curb in that same combined prop mesh stays passable. */
+    make_vertical_panel(&s,&m,verts,idx,N2_SC_TERRAIN,.1f);
+    m.cat=N2_TERRAIN;strcpy(m.sname,"TRN_TEST_PROPSB_CHOP_ANY");
+    verts[7]+=2;verts[12]+=2;
+    assert(collect_one(&s,obst,src,obz)==1);
+    p[0]=1.8f;v[0]=-1;
+    assert(!collide_body_walls(p,v,0,bb,obst,obz,1,.1f,2.2f,&s,src,NULL,0));
+    /* Wall-mounted lights are furniture, not a match for barrier semantics. */
+    assert(n2_scen_class("XO_STREETLIGHTCBWALL_1A_00")==N2_SC_PROP);
+}
+
+/* The optional wall broad phase must reproduce the linear scan bit for bit:
+   same hits, same final position/velocity, including long pushes that leave
+   the query margin and bodies outside the indexed extent. */
+static void test_wall_index_matches_linear(void) {
+    enum { NR = 3000 };
+    static float obst[NR][4], obz[NR][2];
+    unsigned seed = 99u;
+    #define RND() (seed = seed*1664525u + 1013904223u, (float)(seed >> 8) / 16777216.0f)
+    for (int o = 0; o < NR; o++) {
+        float x = RND()*2000.0f - 1000.0f, y = RND()*2000.0f - 1000.0f;
+        float w = RND() < 0.02f ? 150.0f + RND()*400.0f : 2.0f + RND()*40.0f;   /* some huge */
+        float h = 2.0f + RND()*40.0f;
+        obst[o][0] = x; obst[o][1] = y; obst[o][2] = x + w; obst[o][3] = y + h;
+        obz[o][0] = RND()*10.0f; obz[o][1] = obz[o][0] + RND()*20.0f;
+    }
+    int hits_total = 0, far_push = 0;
+    for (int q = 0; q < 20000; q++) {
+        float p0[3] = {0}, v0[2];
+        p0[0] = RND()*2400.0f - 1200.0f;
+        p0[1] = RND()*2400.0f - 1200.0f;
+        v0[0] = RND()*4.0f - 2.0f;
+        v0[1] = RND()*4.0f - 2.0f;
+        float r = 0.5f + RND()*3.0f, z0 = RND()*15.0f, z1 = z0 + 1.5f;
+        float pa[3], va[2], pb[3], vb[2];
+        memcpy(pa, p0, sizeof pa); memcpy(va, v0, sizeof va);
+        memcpy(pb, p0, sizeof pb); memcpy(vb, v0, sizeof vb);
+        phys_wall_index_build(NULL, NULL, 0);
+        int a = collide_walls(pa, va, (const float (*)[4])obst, (const float (*)[2])obz, NR,
+                              r, z0, z1, NULL, NULL, NULL, 0);
+        phys_wall_index_build((const float (*)[4])obst, (const float (*)[2])obz, NR);
+        int b = collide_walls(pb, vb, (const float (*)[4])obst, (const float (*)[2])obz, NR,
+                              r, z0, z1, NULL, NULL, NULL, 0);
+        assert(a == b && !memcmp(pa, pb, sizeof pa) && !memcmp(va, vb, sizeof va));
+        hits_total += a;
+        if (fabsf(pa[0]-p0[0]) >= 4.0f || fabsf(pa[1]-p0[1]) >= 4.0f) far_push++;
+    }
+    #undef RND
+    phys_wall_index_build(NULL, NULL, 0);
+    assert(hits_total > 1000 && far_push > 50);   /* contacts and margin fallback both covered */
+    printf("wall index: 20000 queries identical (%d hits, %d pushes past the margin)\n",
+           hits_total, far_push);
+}
+
 int main(void) {
+    test_authored_barriers_and_baked_walls();
+    test_sloping_curb_is_not_a_rail();
     N2Scene scene;
     N2Mesh mesh;
     float verts[20], obst[1][4], obz[1][2];
@@ -300,6 +403,7 @@ int main(void) {
     test_body_ends_stay_on_wall_side();
     test_body_feature_edges_and_fallback();
     test_rail_uses_body_footprint();
+    test_wall_index_matches_linear();
 
     puts("district_collision_test: PASS");
     return 0;

@@ -139,6 +139,11 @@ void mat_persp(float fov, float aspect, float znear, float zfar, float *m);
 void mat_trans(float x, float y, float z, float *m);
 void mat_rotz(float a, float *m);
 void mat_car(const float *pos, float heading, const float *up, float rideh, float *m);
+/* Unit-quad footprint centred on the model bounds, aligned to heading/ground.
+ * pos is on the receiving ground, up is its unit normal. */
+void mat_car_footprint(const float pos[3],float heading,const float up[3],
+                       const float bb[6],float length_scale,float width_scale,
+                       float lift,float m[16]);
 void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +Z */
 
 /* ---- GPU objects ---- */
@@ -166,6 +171,10 @@ int render_car_glass_order(const N2Scene *scene,const float mvp[16],int *order);
 /* Caller binds r->prog on texture unit zero. Like draw_gpumesh, this sets mesh
  * attributes/buffers; pass uniforms, texture/blend/depth state are restored. */
 /* halo: sprite size multiplier (1 = tuned default); gain: emission multiplier. */
+/* Establish world transform/depth/additive state; restore ordinary depth writes
+ * and fog on exit. Caller binds the program and texture unit zero. */
+int render_world_glows(const RProg *r,const N2Batch *batches,int count,
+                        const float mvp[16]);
 int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
                            const N2LightSrc *lights, int nlights,
                            const float cam[3], const float look[3],

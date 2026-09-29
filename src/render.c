@@ -28,6 +28,34 @@
 #  define GLSL_HEADER "#version 120\n#define lowp\n#define mediump\n#define highp\n"
 #endif
 
+/* World glows use world coordinates, never the preceding car/smoke matrix.
+   Additive fog fades to black so sprite rectangles cannot add fog colour. */
+int render_world_glows(const RProg *r,const N2Batch *batches,int count,
+                        const float mvp[16]) {
+    float fog[3];glGetUniformfv(r->prog,r->uFogColor,fog);
+    render_model(r,NULL);
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,mvp);
+    glUniform1f(r->uAlpha,1);glUniform1f(r->uSoft,0);
+    glUniform3f(r->uFogColor,0,0,0);
+    glEnable(GL_DEPTH_TEST);glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE);
+    int draws=0;
+    for(int i=0;i<count;i++) {
+        const N2Batch *b=&batches[i];
+        if(b->unresolved)continue; /* no texture-backed flare mask available */
+        glUniform1f(r->uUnlit,b->tex?0:1);
+        glUniform1f(r->uUseTex,b->tex?1:0);
+        glUniform1f(r->uEmissiveTex,b->tex?1:0);
+        glUniform3f(r->uColor,1,b->tex?1:.85f,b->tex?1:.5f);
+        glBindTexture(GL_TEXTURE_2D,b->tex);
+        draw_batch(b);draws++;
+    }
+    glUniform3fv(r->uFogColor,1,fog);
+    glUniform1f(r->uEmissiveTex,0);glUniform1f(r->uUnlit,0);
+    glDepthMask(GL_TRUE);glDisable(GL_BLEND);
+    return draws;
+}
+
 int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
                            const N2LightSrc *lights, int nlights,
                            const float cam[3], const float look[3],
@@ -219,7 +247,11 @@ static const char *FS =
     "    gl_FragColor=vec4(mix(uFogColor,t.rgb*uColor,fog),a); return;\n"
     "  }\n"
     "  if(uUnlit>0.5){ float a=uAlpha;\n"
-    "    if(uSoft>0.5){ float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); a*=a; }\n"
+    /* Shadow footprints need a filled rounded rectangle; lamp/neon sprites
+       retain their radial falloff. Both fade to zero at the quad boundary. */
+    "    if(uSoft>0.5){\n"
+    "      if(uSoft>1.5){ float d=length(max(abs(vUV-vec2(0.5))-vec2(0.4),vec2(0.0))); a*=1.0-smoothstep(0.02,0.1,d); }\n"
+    "      else { float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); } a*=a; }\n"
     "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
     /* Positions, normals, light and camera share world space. The model
        includes road tilt and each wheel/brake hub's own transform. */
@@ -373,6 +405,19 @@ void mat_car(const float *pos, float heading, const float *up, float rideh, floa
         pos[0]+up[0]*rideh, pos[1]+up[1]*rideh, pos[2]+up[2]*rideh, 1 };
     memcpy(m,r,sizeof r);
 }
+void mat_car_footprint(const float pos[3],float heading,const float up[3],
+                       const float bb[6],float length_scale,float width_scale,
+                       float lift,float m[16]) {
+    mat_car(pos,heading,up,lift,m);
+    float sx=fmaxf(.5f,bb[3]-bb[0])*length_scale;
+    float sy=fmaxf(.5f,bb[4]-bb[1])*width_scale;
+    float x=(bb[0]+bb[3]-sx)*.5f,y=(bb[1]+bb[4]-sy)*.5f;
+    for(int a=0;a<3;a++) {
+        m[12+a]+=m[a]*x+m[4+a]*y;
+        m[a]*=sx;m[4+a]*=sy;
+    }
+}
+
 /* right-handed lookAt, column-major, up = world +Z */
 void mat_lookat(const float *eye, const float *fwd, float *m) {
     float f[3]={fwd[0],fwd[1],fwd[2]}; vnorm(f);

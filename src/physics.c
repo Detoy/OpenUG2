@@ -8,6 +8,7 @@
 
 /* handbrake: rear grip lets go, the lateral velocity survives → drift */
 #define HANDBRAKE_GRIP   0.985f
+#define HANDBRAKE_DECEL  (5.5f/(PHYS_TICKRATE*PHYS_TICKRATE))
 #define REVERSE_SPD_FRAC 0.2f    /* reverse cap ~45 km/h */
 #define REVERSE_ACCEL    0.7f    /* reverse thrust vs forward */
 #define BRAKE_ACCEL      1.5f    /* braking vs forward thrust: ~10 m/s^2 */
@@ -26,7 +27,7 @@ const PhysSurface PHYS_SURF_ROAD    = { 1.00f, 1.00f, PHYS_FRICTION, PHYS_GRIP, 
 /* Dirt/grass/hillside: it can still be driven onto and across, but it will not
  * carry the car to road speed and it holds the sideways component far longer,
  * so a hill has to be climbed slowly and slid across instead of railed up. */
-const PhysSurface PHYS_SURF_TERRAIN = { 0.55f, 0.50f, 0.99800f,     0.94f,     0.75f };
+const PhysSurface PHYS_SURF_TERRAIN = { 0.55f, 0.50f, 0.99800f,     0.89f,     0.75f };
 
 static float pv_clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 
@@ -222,22 +223,14 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     }
 }
 
-void phys_ride_apply_load(PhysRideState *r, const PhysVehicle *v,
-                          float longitudinal, float lateral, float dt) {
-    static const PhysVehicle NEUTRAL = { 1, 1, 1, 1, 1, 1 };
-    if (!r || dt <= 0 || !r->contact_mask) return;
-    if (!v) v = &NEUTRAL;
-    /* The road spring already restores the chassis to its support plane. Add
-       only the inertial target here: acceleration lifts the nose, braking
-       dives it, and a left turn loads the right side. The bounded angles keep
-       a wall hit or one noisy velocity sample from kicking the body over. */
-    float pitch = pv_clamp(longitudinal / PHYS_RIDE_G * 0.025f * v->pitch_load,
-                           -0.050f, 0.050f);
-    float roll  = pv_clamp(lateral / PHYS_RIDE_G * 0.040f * v->roll_load,
-                           -0.070f, 0.070f);
-    float w = 6.2831853f * PHYS_RIDE_FREQ;
-    r->pitch_rate += w*w * pitch * dt;
-    r->roll_rate  += w*w * roll  * dt;
+void phys_ride_lean(PhysRideState *r, const PhysVehicle *v, float lateral, float dt) {
+    if (!r || dt <= 0) return;
+    float roll = r->contact_mask
+        ? pv_clamp(lateral / PHYS_RIDE_G * 0.040f * (v ? v->roll_load : 1),
+                   -0.070f, 0.070f) : 0;
+    /* Lean belongs to the body mesh. Applying it as suspension torque can
+       unload tyres and launch the car during a flat-road steering reversal. */
+    r->body_roll += (roll-r->body_roll)*(1-expf(-12.0f*dt));
 }
 
 void phys_ride_up(const PhysRideState *ride,float heading,float up[3]) {
@@ -245,6 +238,12 @@ void phys_ride_up(const PhysRideState *ride,float heading,float up[3]) {
     up[0]=-co*p+sn*r;up[1]=-sn*p-co*r;up[2]=1;
     float length=sqrtf(up[0]*up[0]+up[1]*up[1]+1);
     for(int k=0;k<3;k++)up[k]/=length;
+}
+
+void phys_ride_body_up(const PhysRideState *ride,float heading,float up[3]) {
+    PhysRideState body=*ride;
+    body.roll+=body.body_roll;
+    phys_ride_up(&body,heading,up);
 }
 
 void phys_landing_camera(float *offset,float *velocity,float impact,float dt) {
@@ -322,6 +321,7 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     float top = g_phys_tune.top_kmh / 3.6f / PHYS_TICKRATE * sf->topfrac;
     float hf[2] = { cosf(*heading), sinf(*heading) };
     float fwd = vel[0]*hf[0] + vel[1]*hf[1];   /* signed forward speed */
+    if (handbrake) throttle = 0; /* hold at rest, including W/S + Space */
     if (throttle > 0) {
         /* throttle tapers as speed builds: punchy off the line, eases near top */
         float sp = *speed < 0 ? -*speed : *speed;
@@ -346,13 +346,23 @@ float phys_car_step(float pos[3], float vel[2], float *heading, float *speed,
     /* decompose velocity in the new heading frame, clamp forward, scrub side */
     float nf[2] = { cosf(*heading), sinf(*heading) }, nr[2] = { nf[1], -nf[0] };
     float vf = vel[0]*nf[0]+vel[1]*nf[1], vl = vel[0]*nr[0]+vel[1]*nr[1];
-    if (vf >  top) vf =  top;
-    if (vf < -top*REVERSE_SPD_FRAC) vf = -top*REVERSE_SPD_FRAC;
+    /* Changing surface must not instantly delete half the car's speed.
+       Above its surface limit, lose speed at the normal braking rate. */
+    float limit = vf < 0 ? top*REVERSE_SPD_FRAC : top;
+    if (fabsf(vf) > limit)
+        vf = copysignf(fmaxf(limit,fabsf(vf)-PHYS_ACCEL*BRAKE_ACCEL),vf);
     /* surface and vehicle both scale retention; keep the product a contraction
        so a slide can never be amplified. */
     { float lat = sf->lat * vh->lat;
       if (lat > 0.99f) lat = 0.99f; if (lat < 0.50f) lat = 0.50f;
-      vl *= handbrake ? HANDBRAKE_GRIP : lat; }
+      vl *= handbrake ? fminf(HANDBRAKE_GRIP,lat+0.07f) : lat; }
+    if (handbrake) {
+        /* Rear grip releases for a turn, but the brake still dissipates
+           momentum. Clamp the loss so stopping cannot become reversing. */
+        float speed=hypotf(vf,vl);
+        float keep=speed>0 ? fmaxf(0,1-HANDBRAKE_DECEL/speed) : 0;
+        vf*=keep;vl*=keep;
+    }
     vel[0] = nf[0]*vf + nr[0]*vl; vel[1] = nf[1]*vf + nr[1]*vl;
     *speed = vf;                      /* forward speed, for HUD/collision */
     pos[0] += vel[0]; pos[1] += vel[1];
@@ -409,7 +419,7 @@ void phys_selftest(void) {
 
     /* --- surface profiles (M114) --------------------------------------------
      * Flat ground, sustained full throttle, identical inputs: terrain must
-     * settle materially below road speed and must slide measurably more. */
+     * settle materially below road speed without excessive sideways drift. */
     {
         float rp[3]={0,0,0}, rv[2]={0,0}, rh=0, rs=0;
         float tp[3]={0,0,0}, tv[2]={0,0}, th=0, ts=0;
@@ -419,17 +429,39 @@ void phys_selftest(void) {
         }
         assert(PHYS_KMH(ts) < 0.65f * PHYS_KMH(rs));   /* materially slower */
         assert(PHYS_KMH(ts) > 5.0f);                   /* still drivable */
-        /* same steering input from the same speed: terrain keeps more of the
-         * sideways component, i.e. it slides more (phys_car_step returns the
-         * post-grip lateral magnitude). */
-        float ap[3]={0,0,0}, av[2], ah=0, as2=0, bp[3]={0,0,0}, bv[2], bh=0, bs=0;
-        av[0]=bv[0]=30.0f/3.6f/PHYS_TICKRATE; av[1]=bv[1]=0;
-        float dr = 0, dt2 = 0;
+        /* Release steering with sideways momentum: recover in half a second,
+           while dirt remains slightly less grippy than asphalt. */
+        float ap[3]={0},av[2]={.2f,.1f},ah=0,as2=0;
+        float bp[3]={0},bv[2]={.2f,.1f},bh=0,bs=0;
         for (int t = 0; t < 30; t++) {
-            dr  = phys_car_step(ap, av, &ah, &as2, 1.0f, 1.0f, 0, &PHYS_SURF_ROAD, NULL);
-            dt2 = phys_car_step(bp, bv, &bh, &bs,  1.0f, 1.0f, 0, &PHYS_SURF_TERRAIN, NULL);
+            phys_car_step(ap,av,&ah,&as2,0,0,0,&PHYS_SURF_ROAD,NULL);
+            phys_car_step(bp,bv,&bh,&bs,0,0,0,&PHYS_SURF_TERRAIN,NULL);
         }
-        assert(dt2 > dr);                              /* more lateral slide */
+        assert(bv[1]>av[1] && bv[1]<.004f && bp[1]<.85f);
+        /* Asphalt -> dirt decelerates progressively, with no speed snap. */
+        bv[0]=200.0f/3.6f/PHYS_TICKRATE;bv[1]=0;
+        phys_car_step(bp,bv,&bh,&bs,0,0,0,&PHYS_SURF_TERRAIN,NULL);
+        assert(PHYS_KMH(bs)>195 && PHYS_KMH(bs)<200);
+    }
+
+    /* Space stops and holds in either direction, still permits a sliding
+       turn, and releasing it restores powered acceleration. */
+    for(int reverse=0;reverse<2;reverse++) {
+        float p[3]={0},v[2]={reverse?-.2f:.2f,0},h=0,s=v[0];
+        for(int t=0;t<240;t++) {
+            float before=hypotf(v[0],v[1]);
+            phys_car_step(p,v,&h,&s,reverse?-1:1,0,1,NULL,NULL);
+            assert(hypotf(v[0],v[1])<=before && s*(reverse?-1:1)>=0);
+        }
+        assert(v[0]==0 && v[1]==0);
+        phys_car_step(p,v,&h,&s,1,0,0,NULL,NULL);
+        assert(s>0);
+    }
+    {
+        float p[3]={0},v[2]={.3f,0},h=0,s=.3f;
+        for(int t=0;t<30;t++)phys_car_step(p,v,&h,&s,0,1,1,NULL,NULL);
+        assert(h>.1f && fabsf(-v[0]*sinf(h)+v[1]*cosf(h))>.02f);
+        assert(hypotf(v[0],v[1])<.3f);
     }
 
     /* --- vehicle profiles (M121) ---------------------------------------------
@@ -499,32 +531,48 @@ void phys_selftest(void) {
         assert(fabsf(stock.pitch_load-phys_vehicle_from_geometry(0,0,1.5f,2.7f,1.5f,.22f).pitch_load)<1e-6f);
     }
 
-    /* Flat-road load transfer: tyre acceleration biases the sprung chassis,
-       while releasing the input lets the existing suspension settle it. */
-    {
+    /* Hard steering reversals and acceleration/braking must never lift a
+       tyre or remove control. Body lean uses a separate render pose. */
+    for(int profile=0;profile<3;profile++) {
         PhysRideSupport s = {
             .z={0,0,0,0}, .valid={1,1,1,1},
             .ax={1.25f,1.25f,-1.25f,-1.25f},
             .ay={.75f,-.75f,.75f,-.75f}, .vz={0,0,0,0}
         };
         PhysVehicle v = phys_vehicle_from_geometry(4.4f,1.9f,1.5f,2.7f,1.5f,.22f);
+        v.roll_load=.7f+.35f*profile;
         PhysRideState r; phys_ride_init(&r,&s);
-        for(int i=0;i<60;i++){
-            phys_ride_apply_load(&r,&v,7.0f,0,1.0f/60.0f);
+        float pos[3]={0},h=0,spd=(60+80*profile)/3.6f/PHYS_TICKRATE;
+        float vel[2]={spd,0};
+        for(int i=0;i<480;i++) {
+            float steer=i<180 ? 0 : i<240 ? 1 : i<300 ? -1 : 0;
+            float oldh=h,vx=vel[0],vy=vel[1];
+            phys_drive_step(pos,vel,&h,&spd,i<300?1:-1,steer,0,NULL,&v,&r);
+            float lateral=(-(vel[0]-vx)*sinf(h)+(vel[1]-vy)*cosf(h))
+                          *PHYS_TICKRATE*PHYS_TICKRATE;
+            phys_ride_lean(&r,&v,lateral,1.0f/60.0f);
             phys_ride_step(&r,&s,1.0f/60.0f);
+            assert(r.contact_mask==15 && r.air_frames==0);
+            assert(fabsf(r.z)<1e-6f && fabsf(r.pitch)<1e-6f && fabsf(r.roll)<1e-6f);
+            for(int k=0;k<4;k++)assert(fabsf(phys_ride_wheel_z(&r,&s,k))<1e-6f);
+            if(steer)assert((h-oldh)*steer>0); /* steering authority survives */
+            assert(fabsf(r.body_roll)<=.070001f);
+            if(i==239)assert(r.body_roll>.01f);
+            if(i==299)assert(r.body_roll<-.01f);
         }
-        assert(r.pitch > 0.008f && r.pitch < 0.050f);
-        assert(r.contact_mask==15 && fabsf(r.z)<.05f);
-        assert(fabsf(r.roll) < 0.001f);
-        phys_ride_init(&r,&s);
-        for(int i=0;i<60;i++){
-            phys_ride_apply_load(&r,&v,0,8.0f,1.0f/60.0f);
-            phys_ride_step(&r,&s,1.0f/60.0f);
+        for(int i=0;i<120;i++)phys_ride_lean(&r,&v,0,1.0f/60.0f);
+        assert(fabsf(r.body_roll)<.0001f);
+        /* The body leans but the wheel basis does not, at any heading. */
+        r.body_roll=.07f;
+        for(int i=0;i<8;i++) {
+            float wheel[3],body[3];
+            phys_ride_up(&r,i*.785398f,wheel);
+            phys_ride_body_up(&r,i*.785398f,body);
+            assert(wheel[2]==1 && body[2]<.999f);
         }
-        assert(r.roll > 0.010f && r.roll < 0.070f);
-        assert(r.contact_mask==15 && fabsf(r.z)<.05f);
-        for(int i=0;i<120;i++)phys_ride_step(&r,&s,1.0f/60.0f);
-        assert(fabsf(r.roll) < 0.002f);
+        r.contact_mask=0;
+        for(int i=0;i<120;i++)phys_ride_lean(&r,&v,100,1.0f/60.0f);
+        assert(fabsf(r.body_roll)<.0001f); /* relax in genuine flight */
     }
 
 }
@@ -591,19 +639,49 @@ static float cw_segment_pair(float ax,float ay,float bx,float by,
     return best;
 }
 
+float phys_wall_face_height(const float a[3],const float b[3],const float c[3]) {
+    const float *p[3]={a,b,c};
+    float longest=0,height=0;
+    for(int k=0;k<3;k++) {
+        const float *u=p[k],*v=p[(k+1)%3],*w=p[(k+2)%3];
+        float dx=v[0]-u[0],dy=v[1]-u[1],len=dx*dx+dy*dy;
+        if(len<=longest)continue;
+        longest=len;
+        float t=((w[0]-u[0])*dx+(w[1]-u[1])*dy)/len;
+        height=fabsf(w[2]-(u[2]+t*(v[2]-u[2])));
+    }
+    return height;
+}
+
+/* Ground bundles contain combined prop meshes too: a mural/retaining wall
+   can be TRN_*_PROPS while sharing the ground renderer's TERRAIN category. */
+static int embedded_prop_mesh(const N2Mesh *m) {
+    return m->scen==N2_SC_TERRAIN && !strncmp(m->sname,"TRN_",4) &&
+           strstr(m->sname,"_PROPS")!=NULL;
+}
+
 static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
                     float qx, float qy, float r, float cz0, float cz1,
                     float face_min,float face_max,PhysWallContact *out) {
     if (mi < 0 || mi >= s->count) return 0;
     const N2Mesh *m = &s->meshes[mi];
+    /* These meshes can contain curbs as well as walls. Reject thin faces by
+       thickness rather than by their elevation change along a slope. */
+    if(embedded_prop_mesh(m))face_min=fmaxf(face_min,WALL_MIN_FACE_SPAN);
     float r2 = r*r;
     float bestd2 = 1e30f, bcx = 0, bcy = 0, bodyx=px, bodyy=py; int btri = -1;
     float ulo = 1e30f, uhi = -1e30f;                 /* union span of contacts */
     float fnx = 0, fny = 0;                          /* winding normal, fallback */
+    /* Exact early-out: only an edge within r of segment p..q contributes, and
+       Z clipping keeps edges inside the triangle's XY bounds. */
+    float lx0=fminf(px,qx)-r-0.01f, lx1=fmaxf(px,qx)+r+0.01f;
+    float ly0=fminf(py,qy)-r-0.01f, ly1=fmaxf(py,qy)+r+0.01f;
     for (int t = 0; t + 2 < m->nidx; t += 3) {
         const float *A = m->verts + m->idx[t]*5;
         const float *B = m->verts + m->idx[t+1]*5;
         const float *C = m->verts + m->idx[t+2]*5;
+        if ((A[0]<lx0&&B[0]<lx0&&C[0]<lx0) || (A[0]>lx1&&B[0]>lx1&&C[0]>lx1) ||
+            (A[1]<ly0&&B[1]<ly0&&C[1]<ly0) || (A[1]>ly1&&B[1]>ly1&&C[1]>ly1)) continue;
         float e1[3], e2[3], n[3];
         for (int a = 0; a < 3; a++) { e1[a] = B[a]-A[a]; e2[a] = C[a]-A[a]; }
         n[0]=e1[1]*e2[2]-e1[2]*e2[1]; n[1]=e1[2]*e2[0]-e1[0]*e2[2];
@@ -614,6 +692,8 @@ static int cw_shape_feature(const N2Scene *s, int mi, float px, float py,
         if (B[2]<zlo) zlo=B[2]; if (C[2]<zlo) zlo=C[2];
         if (B[2]>zhi) zhi=B[2]; if (C[2]>zhi) zhi=C[2];
         if (zhi-zlo < face_min || zhi-zlo > face_max) continue;
+        /* A low curb can gain metres along a hill without becoming a rail. */
+        if (face_min>0 && phys_wall_face_height(A,B,C)<face_min) continue;
         if (zhi < cz0 || zlo > cz1) continue;                 /* not at car height */
         const float *P[8] = { A, B, C };
         int np = 3;
@@ -699,43 +779,137 @@ static int cw_body_shape(float heading,const float bb[6],float *r,
    index order, stable across runs). Each contact is resolved against the
    position the previous one left behind, so overlapping walls compose instead
    of fighting; within one mesh the closest feature wins. */
-static int cw_resolve(float *pos, float *vel, const float obst[][4],
-                  const float obz[][2], int nobst, float r, float cz0, float cz1,
+/* One rect of the resolve pass: returns 1 when it resolved a contact. */
+static int cw_resolve_one(int o, float *pos, float *vel, const float obst[][4],
+                  const float obz[][2], float r, float cz0, float cz1,
                   const N2Scene *scene, const int *src,
-                  PhysWallContact *log, int maxlog,
+                  PhysWallContact *log, int maxlog, const int *hits,
                   float ax,float ay,float bx,float by) {
-    int hits = 0;
-    for (int o = 0; o < nobst; o++) {
         float x0=obst[o][0]-r, y0=obst[o][1]-r, x1=obst[o][2]+r, y1=obst[o][3]+r;
         if (pos[0]+fmaxf(ax,bx)<=x0 || pos[0]+fminf(ax,bx)>=x1 ||
-            pos[1]+fmaxf(ay,by)<=y0 || pos[1]+fminf(ay,by)>=y1) continue;
+            pos[1]+fmaxf(ay,by)<=y0 || pos[1]+fminf(ay,by)>=y1) return 0;
         /* vertical volumes must actually overlap for this to be a collision */
-        if (obz && (obz[o][1] < cz0 || obz[o][0] > cz1)) continue;
+        if (obz && (obz[o][1] < cz0 || obz[o][0] > cz1)) return 0;
         if (scene && src) {
             /* the rect was broad phase only: resolve against the FACE */
             PhysWallContact c;
             if (!cw_shape_feature(scene, src[o], pos[0]+ax, pos[1]+ay,
                                   pos[0]+bx,pos[1]+by,r,cz0,cz1,0,INFINITY,&c))
-                continue;
+                return 0;
             float vn = vel[0]*c.nx + vel[1]*c.ny;
-            if (c.pen <= 0.0f && vn >= 0.0f) continue;   /* touching, not colliding:
+            if (c.pen <= 0.0f && vn >= 0.0f) return 0;   /* touching, not colliding:
                                                             a car resting against a
                                                             face is not a response */
             if (c.pen > 0.0f) { pos[0] += c.nx * c.pen; pos[1] += c.ny * c.pen; }
             if (vn < 0) { vel[0] -= vn*c.nx; vel[1] -= vn*c.ny; }  /* keep tangent */
-            if (log && hits < maxlog) log[hits] = c;
-            hits++;
-            continue;
+            if (log && *hits < maxlog) log[*hits] = c;
+            return 1;
         }
         /* legacy AABB-only path, for callers with no scene to resolve against */
-        float pl=pos[0]-x0, pr=x1-pos[0], pd=pos[1]-y0, pu=y1-pos[1], m=pl; int ax=0;
-        if (pr<m){m=pr;ax=1;} if (pd<m){m=pd;ax=2;} if (pu<m){m=pu;ax=3;}
-        if      (ax==0){ pos[0]=x0; if(vel[0]>0)vel[0]=0; }
-        else if (ax==1){ pos[0]=x1; if(vel[0]<0)vel[0]=0; }
-        else if (ax==2){ pos[1]=y0; if(vel[1]>0)vel[1]=0; }
-        else           { pos[1]=y1; if(vel[1]<0)vel[1]=0; }
-        hits++;
+        float pl=pos[0]-x0, pr=x1-pos[0], pd=pos[1]-y0, pu=y1-pos[1], m=pl; int side=0;
+        if (pr<m){m=pr;side=1;} if (pd<m){m=pd;side=2;} if (pu<m){m=pu;side=3;}
+        if      (side==0){ pos[0]=x0; if(vel[0]>0)vel[0]=0; }
+        else if (side==1){ pos[0]=x1; if(vel[0]<0)vel[0]=0; }
+        else if (side==2){ pos[1]=y0; if(vel[1]>0)vel[1]=0; }
+        else             { pos[1]=y1; if(vel[1]<0)vel[1]=0; }
+        return 1;
+}
+
+/* Optional exact broad phase for cw_resolve (see physics.h). Rects are binned
+   by raw extent; a query collects every rect near the body's start box, plus a
+   margin, and visits them in ascending index. Rects outside that set cannot
+   overlap until the body has been pushed by the margin; if that ever happens
+   the pass finishes with the linear scan from the current index. */
+#define CWI_CELL 32.0f
+#define CWI_MARGIN 4.0f
+static struct {
+    const float (*obst)[4]; const float (*obz)[2]; int n;
+    float x0, y0; int gw, gh;
+    int *start, *list, *big, nbig;   /* big: rects spanning too many cells */
+    unsigned *stamp, tick;
+    int *cand, ncap;
+} g_cwi;
+
+void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int nobst) {
+    free(g_cwi.start); free(g_cwi.list); free(g_cwi.big); free(g_cwi.stamp); free(g_cwi.cand);
+    memset(&g_cwi, 0, sizeof g_cwi);
+    if (!obst || nobst <= 0) return;
+    float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;
+    for (int o=0;o<nobst;o++) {
+        if(!(obst[o][0]<=obst[o][2] && obst[o][1]<=obst[o][3]))return; /* odd rect: stay linear */
+        x0=fminf(x0,obst[o][0]);y0=fminf(y0,obst[o][1]);
+        x1=fmaxf(x1,obst[o][2]);y1=fmaxf(y1,obst[o][3]);
     }
+    int gw=1+(int)((x1-x0)/CWI_CELL), gh=1+(int)((y1-y0)/CWI_CELL);
+    if (gw<=0 || gh<=0 || (long)gw*gh > (1L<<22)) return;
+    int *count=calloc((size_t)gw*gh+1,sizeof *count), *big=malloc((size_t)nobst*sizeof *big);
+    unsigned *stamp=calloc((size_t)nobst,sizeof *stamp);
+    int *cand=malloc((size_t)nobst*sizeof *cand);
+    if (!count||!big||!stamp||!cand) {free(count);free(big);free(stamp);free(cand);return;}
+    long total=0; int nbig=0;
+    #define CWI_SPAN(o,cx0,cy0,cx1,cy1) int cx0=(int)((obst[o][0]-x0)/CWI_CELL), \
+        cy0=(int)((obst[o][1]-y0)/CWI_CELL), cx1=(int)((obst[o][2]-x0)/CWI_CELL), \
+        cy1=(int)((obst[o][3]-y0)/CWI_CELL)
+    for (int o=0;o<nobst;o++) {
+        CWI_SPAN(o,cx0,cy0,cx1,cy1);
+        if ((long)(cx1-cx0+1)*(cy1-cy0+1) > 64) { big[nbig++]=o; continue; }
+        for(int y=cy0;y<=cy1;y++)for(int x=cx0;x<=cx1;x++){count[y*gw+x+1]++;total++;}
+    }
+    for (int c=0;c<gw*gh;c++) count[c+1]+=count[c];
+    int *list=malloc((size_t)(total?total:1)*sizeof *list), *fill=malloc((size_t)gw*gh*sizeof *fill);
+    if (!list||!fill) {free(count);free(big);free(stamp);free(cand);free(list);free(fill);return;}
+    memcpy(fill,count,(size_t)gw*gh*sizeof *fill);
+    for (int o=0;o<nobst;o++) {
+        CWI_SPAN(o,cx0,cy0,cx1,cy1);
+        if ((long)(cx1-cx0+1)*(cy1-cy0+1) > 64) continue;
+        for(int y=cy0;y<=cy1;y++)for(int x=cx0;x<=cx1;x++)list[fill[y*gw+x]++]=o;
+    }
+    #undef CWI_SPAN
+    free(fill);
+    g_cwi.obst=obst;g_cwi.obz=obz;g_cwi.n=nobst;g_cwi.x0=x0;g_cwi.y0=y0;g_cwi.gw=gw;g_cwi.gh=gh;
+    g_cwi.start=count;g_cwi.list=list;g_cwi.big=big;g_cwi.nbig=nbig;
+    g_cwi.stamp=stamp;g_cwi.cand=cand;g_cwi.ncap=nobst;
+}
+
+static int cwi_int_cmp(const void *a,const void *b){int x=*(const int*)a,y=*(const int*)b;return (x>y)-(x<y);}
+
+static int cw_resolve(float *pos, float *vel, const float obst[][4],
+                  const float obz[][2], int nobst, float r, float cz0, float cz1,
+                  const N2Scene *scene, const int *src,
+                  PhysWallContact *log, int maxlog,
+                  float ax,float ay,float bx,float by) {
+    int hits = 0, from = 0;
+    if (g_cwi.start && (const float (*)[4])obst == g_cwi.obst &&
+        (const float (*)[2])obz == g_cwi.obz && nobst == g_cwi.n) {
+        float m = r + CWI_MARGIN, sx = pos[0], sy = pos[1];
+        float qx0=pos[0]+fminf(ax,bx)-m, qx1=pos[0]+fmaxf(ax,bx)+m;
+        float qy0=pos[1]+fminf(ay,by)-m, qy1=pos[1]+fmaxf(ay,by)+m;
+        int cx0=(int)floorf((qx0-g_cwi.x0)/CWI_CELL), cx1=(int)floorf((qx1-g_cwi.x0)/CWI_CELL);
+        int cy0=(int)floorf((qy0-g_cwi.y0)/CWI_CELL), cy1=(int)floorf((qy1-g_cwi.y0)/CWI_CELL);
+        if(cx0<0)cx0=0; if(cy0<0)cy0=0; if(cx1>=g_cwi.gw)cx1=g_cwi.gw-1; if(cy1>=g_cwi.gh)cy1=g_cwi.gh-1;
+        if (++g_cwi.tick == 0) { memset(g_cwi.stamp,0,(size_t)g_cwi.ncap*sizeof *g_cwi.stamp); g_cwi.tick=1; }
+        int nc = 0;
+        for (int k=0;k<g_cwi.nbig;k++) { g_cwi.stamp[g_cwi.big[k]]=g_cwi.tick; g_cwi.cand[nc++]=g_cwi.big[k]; }
+        for (int y=cy0;y<=cy1;y++) for (int x=cx0;x<=cx1;x++) {
+            int c=y*g_cwi.gw+x;
+            for (int k=g_cwi.start[c];k<g_cwi.start[c+1];k++) {
+                int o=g_cwi.list[k];
+                if (g_cwi.stamp[o]!=g_cwi.tick) { g_cwi.stamp[o]=g_cwi.tick; g_cwi.cand[nc++]=o; }
+            }
+        }
+        qsort(g_cwi.cand,(size_t)nc,sizeof *g_cwi.cand,cwi_int_cmp);
+        from = nobst;                        /* no linear tail unless pushed far */
+        for (int k=0;k<nc;k++) {
+            int o=g_cwi.cand[k];
+            if (!cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by))
+                continue;
+            hits++;
+            if (fabsf(pos[0]-sx) >= CWI_MARGIN || fabsf(pos[1]-sy) >= CWI_MARGIN) { from=o+1; break; }
+        }
+    }
+    for (int o = from; o < nobst; o++)
+        if (cw_resolve_one(o,pos,vel,obst,obz,r,cz0,cz1,scene,src,log,maxlog,&hits,ax,ay,bx,by))
+            hits++;
     return hits;
 }
 
@@ -804,7 +978,7 @@ void collide_walls_selftest(void) {
 /* Which scenery stops a car (Phase 65). Each mesh now carries its asset-name
  * class, so the decision is semantic instead of a pure height guess:
  *   BUILDING / WALL / STRUCT -> solid, except narrow XS roadside signs
- *   TREE / TERRAIN           -> never a wall here (ground is the query's job)
+ *   TERRAIN                  -> ground, except combined TRN_*_PROPS geometry
  *   PROP  -> MEASURED, not assumed: the XO_ prefix mixes 1x1x1.5 m boxes
  *            (XO_IP_WBOX) with 24x29x36 m office blocks (XO_INDUSTRIALOFFICESA)
  *            and 7x8x26 m tower containers, so the prefix alone cannot decide.
@@ -824,15 +998,15 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max) {
     int nobst = 0;
     for (int i = 0; i < s->count && nobst < max; i++) {
-        int sc = s->meshes[i].scen;
+        int sc = s->meshes[i].scen, baked_props=embedded_prop_mesh(&s->meshes[i]);
         int prop_check = 0;
         if (sc != N2_SC_NONE) {                 /* named: decide semantically */
-            if (sc == N2_SC_TERRAIN) continue;              /* ground, never a wall */
+            if (sc == N2_SC_TERRAIN && !baked_props) continue;
             /* props, trees and unclassified: let measured size decide, so a tree
                cluster or a big container still blocks but a trunk/pole does not.
                XS includes small roadside signs as well as large storefront
                signs; the measured footprint keeps only the latter solid. */
-            if (!scen_is_wall(sc) ||
+            if ((!scen_is_wall(sc) && !baked_props) ||
                 (sc == N2_SC_STRUCT && !strncmp(s->meshes[i].sname,"XS_",3)))
                 prop_check = 1;
         } else if (s->meshes[i].cat != N2_OTHER) continue;   /* unnamed fallback */
@@ -847,7 +1021,7 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
          * are only 0.548 m tall but have real 0.539 m vertical faces. Let the
          * geometric narrow phase distinguish those from a sub-0.30 m seam.
          * Keep the 2.5 m heuristic for props/unclassified meshes only. */
-        if (!scen_is_wall(sc) && oz1-oz0 < WALL_MIN_HEIGHT) continue;
+        if (!scen_is_wall(sc) && !baked_props && oz1-oz0 < WALL_MIN_HEIGHT) continue;
         if (ox1-ox0 > WALL_MAX_SPAN || oy1-oy0 > WALL_MAX_SPAN) continue;
         if (prop_check) {   /* ponytail: thin street furniture passes through until dynamic knockdown exists */
             float sx = ox1-ox0, sy = oy1-oy0, smin = sx < sy ? sx : sy;
@@ -877,15 +1051,15 @@ int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
 }
 
 float phys_car_contacts(float carpos[3], float vel[2], float speed,
-                        float heading, const float bb[6], AiCar *ais, int nai) {
+                        float heading, const float bb[6], float mass, AiCar *ais, int nai) {
     float pl=bb?0.5f*(bb[3]-bb[0]):2.2f;
     float pw=bb?0.5f*(bb[4]-bb[1]):1.0f;
     float ph=bb?bb[5]-bb[2]:1.6f;
     if(pl<1.0f)pl=2.2f;if(pw<0.5f)pw=1.0f;if(ph<1.0f)ph=1.6f;
     float pf[2]={cosf(heading),sinf(heading)},ps[2]={pf[1],-pf[0]};
     float thud = 0.0f;
-    /* One moving body against the supplied body snapshot. This same response
-       serves player and AI; callers retain the resolved position/velocity. */
+    float inv=1.0f/(mass>0?mass:1.4f);
+    /* Call once per live pair; both cars retain separation and momentum. */
     for (int k = 0; k < nai; k++) {
         float ah=ais[k].height>1.0f?ais[k].height:1.6f;
         if(carpos[2]+ph<ais[k].pos[2]+0.05f ||
@@ -910,9 +1084,17 @@ float phys_car_contacts(float carpos[3], float vel[2], float speed,
             if(pen<best){best=pen;nx=ux*(dist>=0?1:-1);ny=uy*(dist>=0?1:-1);}
         }
         if(!overlap)continue;
-        carpos[0]-=nx*(best+0.01f);carpos[1]-=ny*(best+0.01f);
-        float inward=vel[0]*nx+vel[1]*ny;
-        if(inward>0){vel[0]-=inward*nx;vel[1]-=inward*ny;}
+        float other_inv=1.0f/(ais[k].mass>0?ais[k].mass:1.4f),sum=inv+other_inv;
+        float move=(best+0.01f)/sum;
+        carpos[0]-=nx*move*inv;carpos[1]-=ny*move*inv;
+        ais[k].pos[0]+=nx*move*other_inv;ais[k].pos[1]+=ny*move*other_inv;
+        float inward=(vel[0]-ais[k].vel[0])*nx+(vel[1]-ais[k].vel[1])*ny;
+        if(inward>0) {
+            float impulse=1.1f*inward/sum; /* low restitution: no pinball bounce */
+            vel[0]-=impulse*inv*nx;vel[1]-=impulse*inv*ny;
+            ais[k].vel[0]+=impulse*other_inv*nx;ais[k].vel[1]+=impulse*other_inv*ny;
+        }
+        ais[k].spd=ais[k].vel[0]*af[0]+ais[k].vel[1]*af[1];
         float s=fabsf(speed)/PHYS_MAXSPD;
         if(0.3f+s*0.5f>thud)thud=0.3f+s*0.5f;
     }
@@ -926,5 +1108,5 @@ int phys_ai_overlap(const AiCar *a, const AiCar *b) {
     float h=a->height>1.0f?a->height:1.6f;
     float bb[6]={-l,-w,0,l,w,h};
     AiCar other=*b;
-    return phys_car_contacts(pos,vel,0,a->head,bb,&other,1)>0;
+    return phys_car_contacts(pos,vel,0,a->head,bb,a->mass,&other,1)>0;
 }

@@ -664,7 +664,14 @@ static int n2_scen_class(const char *nm) {
     if (!nm || !nm[0]) return N2_SC_NONE;
     if (!strncmp(nm, "TRN", 3) || !strncmp(nm, "PAN", 3)) return N2_SC_TERRAIN;
     if (!strncmp(nm, "XB",  2)) return N2_SC_BUILDING;   /* buildings/barriers */
-    if (!strncmp(nm, "XO",  2)) return N2_SC_PROP;       /* poles, cans, barrels */
+    if (!strncmp(nm, "XO", 2)) {
+        /* Authored obstacle roles also occur in the object family. Do not
+           confuse wall-mounted lights with the walls they illuminate. */
+        if (strstr(nm,"GUARD") || strstr(nm,"BARRIER") || strstr(nm,"FENCE") ||
+            strstr(nm,"RAILING") || (strstr(nm,"WALL") && !strstr(nm,"LIGHT")))
+            return N2_SC_WALL;
+        return N2_SC_PROP;                             /* poles, cans, barrels */
+    }
     if (!strncmp(nm, "XT",  2)) return N2_SC_TREE;
     if (!strncmp(nm, "XW",  2)) return N2_SC_WALL;       /* walls / fences */
     if (!strncmp(nm, "XS",  2) || !strncmp(nm, "XV", 2)) return N2_SC_STRUCT;
@@ -2920,33 +2927,87 @@ static void n2_car_profile(const N2Scene *s, const char *name,
     p->clearance = p->ride + b0[2];
 }
 
-/* Exact wheel geometry from a per-car table in GLOBALB.BUN (the decompressed
- * GlobalB.lzc). Structural audit correction: these path anchors are NOT inside
- * a 0x00135200 AttribSys record, so do not use that reader as proof of this
- * fixed-offset layout. The unique "CARS\<NAME>\GEOMETRY.BIN" path locates a
- * repeating 2192-byte record; the wheel block sits 0x40 before the path.
- * Front/rear axle X and half-track Y are in the same frame and scale as the
- * model and reproduce real spec dimensions across the sampled fleet. This
- * supersedes the body-box fraction fallback. Returns 1 on a plausible hit. */
+/* UG2 GLOBALB: chunk 0x34600, eight 0x11 filler bytes, then 0x890-byte
+ * car records. Container framing is shared; this record layout is UG2-specific.
+ * Never locate records by searching texture/UI payloads for a path string. */
+#define N2_GLOBAL_CAR_STRIDE 0x890
+
+typedef struct { long beg,end; int tables,valid; } N2GlobalCarTable;
+static int n2_global_car_table_visit(const unsigned char *g,uint32_t tag,
+                                      long payload,long end,void *ctx) {
+    N2GlobalCarTable *t=(N2GlobalCarTable *)ctx;
+    if(tag==0x00034600u) {
+        t->tables++;
+        if(end-payload<8+N2_GLOBAL_CAR_STRIDE ||
+           (end-payload-8)%N2_GLOBAL_CAR_STRIDE) {t->valid=0;return 0;}
+        for(int i=0;i<8;i++)if(g[payload+i]!=0x11)t->valid=0;
+        t->beg=payload+8;t->end=end;
+    }
+    return (tag>>28)==8;
+}
+static int n2_global_car_table(const unsigned char *g,long glen,N2GlobalCarTable *t) {
+    if(!t)return 0;
+    *t=(N2GlobalCarTable){0,0,0,1};
+    return asset_chunks_walk(g,0,glen,n2_global_car_table_visit,t) &&
+           t->valid && t->tables==1;
+}
 static long n2_global_car_record(const unsigned char *g,long glen,const char *carname) {
-    if (!g || !carname) return -1;
-    char sig[128];
-    int n = snprintf(sig, sizeof sig, "CARS\\%s\\GEOMETRY.BIN", carname);
-    if (n <= 0 || n >= (int)sizeof sig) return -1;
-    long at = -1;
-    for (long i = 0; i + n <= glen; i++)
-        if (g[i] == (unsigned char)sig[0] && memcmp(g+i,sig,(size_t)n)==0) {
-            if (at >= 0) return -1; /* ambiguous archive: never guess a record */
-            at=i;
+    N2GlobalCarTable t;
+    if(!carname || !n2_global_car_table(g,glen,&t))return -1;
+    long found=-1;
+    for(long at=t.beg;at<t.end;at+=N2_GLOBAL_CAR_STRIDE) {
+        const char *name=(const char *)g+at,*path=name+0x40;
+        if(!memchr(name,0,32) || !name[0] || !memchr(path,0,32))return -1;
+        char expected[32];int n=snprintf(expected,sizeof expected,"CARS\\%s\\GEOMETRY.BIN",name);
+        if(n<=0 || n>=(int)sizeof expected || strcmp(path,expected))return -1;
+        if(!strcmp(name,carname)) {
+            if(found>=0)return -1; /* ambiguous table: never choose a duplicate */
+            found=at;
         }
-    return at < 0x40 ? -1 : at-0x40;
+    }
+    return found;
+}
+
+/* Source dimensions/inertia for diagnostics and subsequent dynamics work.
+ * No render bounds, contact footprint or handling constants are replaced here.
+ * The four wheel entries stay in source index order; wheel Z is still unverified. */
+typedef struct { float x,y,radius,width; } N2WheelShapeAttr;
+typedef struct {
+    long record_offset;
+    float mass_tonnes,body[3],inertia[3]; /* L/W/H metres; Ixx/Iyy/Izz tonne*m^2 */
+    N2WheelShapeAttr wheel[4];
+} N2CarShapeAttr;
+static int n2_global_car_shape(const unsigned char *g,long glen,const char *name,
+                                N2CarShapeAttr *out) {
+    if(!out)return 0;
+    long at=n2_global_car_record(g,glen,name);
+    if(at<0)return 0;
+    N2CarShapeAttr a={0};a.record_offset=at;
+    memcpy(&a.mass_tonnes,g+at+0x220,4);
+    if(!isfinite(a.mass_tonnes) || a.mass_tonnes<=0)return 0;
+    memcpy(a.body,g+at+0x224,sizeof a.body);
+    for(int k=0;k<3;k++) {
+        memcpy(&a.inertia[k],g+at+0x230+20*k,4);
+        if(!isfinite(a.body[k]) || a.body[k]<=0 ||
+           !isfinite(a.inertia[k]) || a.inertia[k]<=0)return 0;
+    }
+    for(int k=0;k<4;k++) {
+        long w=at+0x120+0x30*k;
+        if(n2_u32(g+w+0x18)!=(uint32_t)k)return 0;
+        N2WheelShapeAttr *v=&a.wheel[k];
+        memcpy(&v->x,g+w,4);memcpy(&v->y,g+w+4,4);
+        memcpy(&v->radius,g+w+0x10,4);memcpy(&v->width,g+w+0x14,4);
+        if(!isfinite(v->x) || !isfinite(v->y) || !isfinite(v->radius) ||
+           v->radius<=0 || !isfinite(v->width) || v->width<=0)return 0;
+    }
+    *out=a;return 1;
 }
 
 typedef struct { float front_axle, rear_axle, front_track, rear_track; } N2WheelAttr;
 static int n2_global_wheel_attr(const unsigned char *g, long glen,
                                 const char *carname, N2WheelAttr *w) {
     if (!w) return 0;
-    long base = n2_global_car_record(g,glen,carname); /* wheel block precedes path */
+    long base = n2_global_car_record(g,glen,carname);
     if (base < 0 || base + 392 + 4 > glen) return 0;
     float fx, rx, fy, ry;                        /* front/rear axle X, front/rear half-track Y */
     memcpy(&fx, g + base + 288, 4); memcpy(&rx, g + base + 384, 4);
@@ -2962,7 +3023,9 @@ static int n2_global_wheel_attr(const unsigned char *g, long glen,
 
 /* Stock and upgraded powertrain data from the same 0x890-byte GLOBALB car
  * record. Values remain in source units; physics.c maps them to the arcade
- * model. Four gearbox blocks and four torque-gain curves are stored per car. */
+ * model. Four gearbox blocks, a master gain curve and three upgrade curves are
+ * stored per car. Torque units/sample RPMs and the steering label remain
+ * interpretations; exposing source values does not recover the original solver. */
 typedef struct {
     float final_drive, reverse, forward[6];
     int gear_count;
@@ -2982,7 +3045,7 @@ static int n2_global_physics_attr(const unsigned char *g,long glen,
     static const int gain_at[4]={0x530,0x570,0x5b0,0x5f0};
     if(!a)return 0;
     long record=n2_global_car_record(g,glen,carname);
-    if(record<0 || record+0x890>glen)return 0;
+    if(record<0)return 0; /* the table reader guarantees a complete record */
 #define N2_PA_F(dst,off) memcpy(&(dst),g+record+(off),4)
     memset(a,0,sizeof *a);
     N2_PA_F(a->mass_tonnes,0x220);

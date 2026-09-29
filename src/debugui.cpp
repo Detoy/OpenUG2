@@ -66,7 +66,7 @@ static void part_selector(int p) {
 
 
 /* ---------------------------------------------------------------------------
- * Placement marks. The user drives (or freecams) to a spot that looks wrong,
+ * Placement marks. The user drives to a spot that looks wrong,
  * presses M, then drives to where it should be and presses Shift+M. Each mark
  * records the probe point AND what the production ground selector reports
  * under it, so a report names the actual covering chunk instead of an XY guess.
@@ -405,7 +405,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::SliderFloat("height (up)",     &g_dbg.chase_height,    1.0f, 15.0f, "%.1f m");
             ImGui::SliderFloat("stiffness (lerp)",&g_dbg.chase_stiffness, 0.02f, 1.0f, "%.2f/frame");
             if (ImGui::Button("reset chase cam")) {
-                g_dbg.chase_distance=6.0f; g_dbg.chase_height=3.0f; g_dbg.chase_stiffness=0.22f;
+                g_dbg.chase_distance=4.0f; g_dbg.chase_height=2.0f; g_dbg.chase_stiffness=0.22f;
             }
             ImGui::TextDisabled("low stiffness = looser spring; 1.0 = rigidly glued");
             ImGui::Separator();
@@ -466,6 +466,17 @@ extern "C" void dbgui_frame(void) {
             if (ImGui::Combo("track", &cur, items, n) && cur != g_dbg.sel_track) g_dbg.want_track = cur;
         } else ImGui::Text("track: %s (%d/%d)", g_dbg.track_name, g_dbg.sel_track+1, g_dbg.n_tracks);
         ImGui::Text("circuit: %d/%d   |   %d track meshes", g_dbg.sel_circuit+1, g_dbg.n_circuits, g_dbg.track_meshes);
+        ImGui::SeparatorText("Traffic");
+        ImGui::BeginDisabled(!g_dbg.traffic_available);
+        ImGui::SliderInt("Traffic density", &g_dbg.traffic_target, 0, g_dbg.traffic_max, "%d cars");
+        if(ImGui::Button("Default traffic"))g_dbg.traffic_target=4;
+        ImGui::Checkbox("Draw off-screen traffic (diagnostic)",(bool *)&g_dbg.traffic_cull_off);
+        ImGui::EndDisabled();
+        ImGui::Text("Active traffic: %d / %d   Roaming racers: %d   On screen: %d",
+                    g_dbg.traffic_active,g_dbg.traffic_target,g_dbg.traffic_racers,
+                    g_dbg.traffic_visible);
+        ImGui::TextWrapped("Applies live. Cars spawn on clear roads out of view; excess cars leave when out of view. Roaming racers are unchanged.");
+        if(!g_dbg.traffic_available)ImGui::TextDisabled("Available during open-world driving with road paths.");
         ImGui::Checkbox("Show UV Checker", (bool *)&g_dbg.show_uv_checker);
         ImGui::Separator();
         if (ImGui::CollapsingHeader("Scenery Semantics (asset names, 0x134011)", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -498,12 +509,12 @@ extern "C" void dbgui_frame(void) {
     if (ImGui::BeginTabItem("Placement Marks")) {
         static bool hotkeys = true;
         static char status[256] = "";
-        ImGui::TextWrapped("Drive or freecam onto a spot, then mark it. M = the "
+        ImGui::TextWrapped("Drive onto a spot, then mark it. M = the "
                            "defect, Shift+M = where it should be. Fill the note first "
                            "so both ends of a pair share a name. (F9/F10 still work "
                            "where the function row is reachable.)");
         ImGui::Separator();
-        ImGui::Text("probe   %s", g_dbg.freecam ? "camera (freecam)" : "car");
+        ImGui::TextUnformatted("probe   car");
         ImGui::Text("XYZ     %9.2f  %9.2f  %8.2f",
                     g_dbg.probe[0], g_dbg.probe[1], g_dbg.probe[2]);
         ImGui::Text("ground  z=%8.2f  %s", g_dbg.probe_ground_z,
@@ -587,9 +598,8 @@ extern "C" void dbgui_frame(void) {
         ImGui::Text("car XYZ     %.1f  %.1f  %.1f", g_dbg.car[0], g_dbg.car[1], g_dbg.car[2]);
         ImGui::Text("heading %.2f rad   %.0f km/h", g_dbg.heading, g_dbg.kmh);
         ImGui::Separator();
-        ImGui::Checkbox("Freecam (F)", (bool *)&g_dbg.freecam);
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderFloat("freecam speed", &g_dbg.speed, 0.05f, 3.0f);
+        ImGui::Checkbox("Orbit camera (F)", (bool *)&g_dbg.freecam);
+        ImGui::TextWrapped("Hold right mouse and drag to look around the car.");
         ImGui::EndTabItem();
     }
 

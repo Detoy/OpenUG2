@@ -144,6 +144,7 @@ typedef struct {
     float z, vz;                 /* sprung body reference plane, m and m/s      */
     float pitch, pitch_rate;     /* + = nose up,     rad, rad/s                 */
     float roll,  roll_rate;      /* + = left side up, rad, rad/s                */
+    float body_roll;             /* cosmetic cornering lean; never wheel contact */
     float compression[4];        /* m, + = compressed, - = drooping             */
     unsigned contact_mask;       /* bit k set = wheel k has reachable support   */
     int   air_frames;            /* consecutive frames with no contact at all   */
@@ -180,14 +181,13 @@ float phys_ride_support_vz(const float normal[3], const float vel[2],
                           float old_heading, float heading, float ax, float ay, float dt);
 /* Advance one fixed step. dt in seconds (the game passes 1.0f/60.0f). */
 void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt);
-/* Add the chassis response to tyre acceleration before phys_ride_step().
- * Acceleration is in m/s^2 in the car frame: +longitudinal is forward and
- * +lateral is left. Airborne cars receive no tyre load. */
-void phys_ride_apply_load(PhysRideState *r, const PhysVehicle *v,
-                          float longitudinal, float lateral, float dt);
+/* Visual body lean only; lateral acceleration is m/s^2, positive left.
+ * No acceleration/braking pitch or torque on the wheel-contact solver. */
+void phys_ride_lean(PhysRideState *r, const PhysVehicle *v, float lateral, float dt);
 /* World Z of wheel k's contact point under the current body pose. */
 float phys_ride_wheel_z(const PhysRideState *r, const PhysRideSupport *s, int k);
 void phys_ride_up(const PhysRideState *ride, float heading, float up[3]);
+void phys_ride_body_up(const PhysRideState *ride, float heading, float up[3]);
 void phys_landing_camera(float *offset, float *velocity, float impact, float dt);
 
 /* sf == NULL is the road profile; vh == NULL is a neutral car. */
@@ -245,6 +245,8 @@ typedef struct {
  * mesh, not to a single triangle, so a tessellated wall built from short strips
  * still spans its true height. No asset name or class is consulted. */
 #define WALL_MIN_FACE_SPAN 0.30f
+/* Vertical thickness across a face, excluding its grade along the road. */
+float phys_wall_face_height(const float a[3], const float b[3], const float c[3]);
 
 /* Narrow phase. Returns 1 and fills *out (may be NULL) with the CLOSEST
  * contacted feature on mesh mi, 0 if that mesh presents no wall here. */
@@ -280,13 +282,20 @@ void phys_selftest(void);   /* asserts the NFSU2 velocity tuning targets */
  * each rect came from (pass NULL to ignore). Selection semantics are unchanged;
  * src exists so a diagnostic can name the mesh behind a collision response
  * without re-implementing the predicate. */
+/* Optional exact broad phase for collide_walls/collide_body_walls. Call after
+ * every (re)assignment of an obstacle array; only calls passing exactly that
+ * obst/obz pointer pair and count use it, all others scan linearly. Results
+ * are identical to the linear scan (same rects, same ascending order). NULL
+ * clears it. Not thread-safe: the frame thread owns it. */
+void phys_wall_index_build(const float (*obst)[4], const float (*obz)[2], int nobst);
 int phys_collect_walls(const N2Scene *s, float (*obst)[4], int *src,
                        float (*obz)[2], int max);
 
-/* Resolve a moving vehicle against a snapshot of other oriented bodies.
+/* Resolve live oriented bodies, sharing displacement and collision impulse.
+ * Masses are tonnes; zero uses a neutral 1.4 tonnes when source data is absent.
  * Returns the collision thud amplitude for the audio (0 = no hit). */
 float phys_car_contacts(float carpos[3], float vel[2], float speed,
-                        float heading, const float bb[6], AiCar *ais, int nai);
+                        float heading, const float bb[6], float mass, AiCar *ais, int nai);
 int phys_ai_overlap(const AiCar *a, const AiCar *b);
 
 #endif

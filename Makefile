@@ -27,8 +27,8 @@ else
 endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
-SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c
-HDRS := src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h
+SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c
+HDRS := src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/hud.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -98,6 +98,14 @@ car-material-test: tools/car_material_test.c src/nfsu2.h src/car_config.h src/ca
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc tools/car_material_test.c -o build/car_material_test -lm
 	./build/car_material_test
+
+# HUD maths only: no GL calls are executed, but hud.c still references the GL
+# symbols, so the link needs the same libraries as the engine.
+hud-test: tools/hud_test.c src/hud.c src/hud.h src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/hud_test.c src/hud.c src/render.c \
+		-o build/hud_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/hud_test
 
 world-render-test: tools/world_render_test.c src/nfsu2.h
 	@mkdir -p build

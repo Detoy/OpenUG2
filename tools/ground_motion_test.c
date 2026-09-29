@@ -32,6 +32,47 @@ static void close_to(float a, float b) {
     assert(fabsf(a-b)<0.0001f);
 }
 
+static void slope_spawn(float grade,float heading) {
+    /* A long wheelbase can span more height than static suspension reach.
+       Initial placement must use the actual slope, not four level probes. */
+    float v[]={-20,-20,0,0,0,20,-20,0,0,0,20,20,0,0,0,-20,20,0,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    float co=cosf(heading),si=sinf(heading);
+    for(int k=0;k<4;k++) {
+        float x=v[k*5],y=v[k*5+1];v[k*5+2]=grade*x+.03f*y;
+        v[k*5]=co*x-si*y;v[k*5+1]=si*x+co*y;
+    }
+    N2Mesh mesh={.verts=v,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD};
+    N2Scene scene={&mesh,1,1};PhysRideSupport sup={0};
+    for(int k=0;k<4;k++){sup.ax[k]=k<2?4:-4;sup.ay[k]=(k&1)?-1.2f:1.2f;}
+    float pos[3]={0},vel[2]={0};
+    int contacts=world_ride_gather(&scene,pos,heading,vel,heading,NULL,&sup,NULL,NULL,NULL);
+    printf("slope spawn grade=%+.2f heading=%.2f contacts=%d\n",grade,heading,contacts);fflush(stdout);
+    assert(contacts==4);
+    PhysRideState ride;phys_ride_init(&ride,&sup);
+    close_to(ride.pitch,grade);close_to(ride.roll,.03f);
+    for(int i=0;i<120;i++) {
+        assert(world_ride_gather(&scene,pos,heading,vel,heading,&ride,&sup,NULL,NULL,NULL)==4);
+        phys_ride_step(&ride,&sup,1.0f/60.0f);pos[2]=ride.z;
+        assert(ride.contact_mask==15 && fabsf(ride.z)<.001f);
+    }
+    /* This is placement only: never rotate a live unsupported body onto road. */
+    ride=(PhysRideState){0};pos[2]=0;
+    assert(world_ride_gather(&scene,pos,heading,vel,heading,&ride,&sup,NULL,NULL,NULL)<4);
+    /* No reachable centre floor: do not recover onto a deck or down from air. */
+    for(int side=-1;side<=1;side+=2) {
+        pos[2]=side*3;
+        assert(world_ride_gather(&scene,pos,heading,vel,heading,NULL,&sup,NULL,NULL,NULL)==0);
+    }
+    /* A centre plane cannot manufacture road beyond an actual edge. */
+    pos[2]=0;
+    for(int k=1;k<=2;k++) {
+        float x=1,y=k==1?-20:20;
+        v[k*5]=co*x-si*y;v[k*5+1]=si*x+co*y;v[k*5+2]=grade*x+.03f*y;
+    }
+    assert(world_ride_gather(&scene,pos,heading,vel,heading,NULL,&sup,NULL,NULL,NULL)==2);
+}
+
 static void slope_contact(float grade, float heading, float step, int reverse) {
     /* A continuous 6% descent at 108 km/h: no edge, seam or missing mesh.
      * A damper must resist suspension travel, not travel down the road. */
@@ -81,7 +122,38 @@ static void slope_contact(float grade, float heading, float step, int reverse) {
     assert(r.contact_mask==0);close_to(r.vz,vz-PHYS_RIDE_G*dt);
 }
 
+static void camera_collision_test(void) {
+    float v[]={0,-2,-2,0,0, 0,2,-2,0,0, 0,2,2,0,0, 0,-2,2,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh m={.verts=v,.nverts=4,.idx=idx,.nidx=6,.cat=N2_OTHER};
+    N2Scene s={&m,1,1};float bounds[1][4]={{0,-2,0,2}};
+    for(int side=-1;side<=1;side+=2) {
+        float a[]={side*2,0,0},eye[]={-side*4,0,0};
+        assert(world_camera_clip(&s,bounds,a,eye,.25f)<1);
+        assert(fabsf(eye[0]-side*.25f)<.0002f);
+        /* Long movement also catches a zero-thickness, reverse-facing wall. */
+        eye[0]=-side*100;world_camera_clip(&s,bounds,a,eye,.25f);
+        assert(fabsf(eye[0]-side*.25f)<.0002f);
+    }
+    float a[]={2,2.1f,0},eye[]={-4,2.1f,0};
+    world_camera_clip(&s,bounds,a,eye,.25f);
+    assert(eye[0]>.22f && eye[0]<.24f); /* sphere brushes finite wall edge */
+    a[1]=eye[1]=3;eye[0]=-4;
+    close_to(world_camera_clip(&s,bounds,a,eye,.25f),1);close_to(eye[0],-4);
+    /* Road and overhead sheets block from either side; sky/glow do not. */
+    for(int i=0;i<4;i++){v[i*5]=v[i*5+2];v[i*5+2]=0;}
+    m.cat=N2_ROAD;a[0]=eye[0]=a[1]=eye[1]=0;a[2]=2;eye[2]=-4;
+    world_camera_clip(&s,NULL,a,eye,.25f);assert(fabsf(eye[2]-.25f)<.0002f);
+    a[2]=-2;eye[2]=4;world_camera_clip(&s,NULL,a,eye,.25f);
+    assert(fabsf(eye[2]+.25f)<.0002f);
+    m.cat=N2_GLOW;eye[2]=4;close_to(world_camera_clip(&s,NULL,a,eye,.25f),1);
+    m.cat=N2_SKY;close_to(world_camera_clip(&s,NULL,a,eye,.25f),1);
+    puts("camera sweep: PASS (two-sided walls, edges, clearance, floor/ceiling, long moves)");
+}
+
 int main(void) {
+    camera_collision_test();
+    slope_spawn(.08f,0);slope_spawn(-.08f,1.2f);
     /* A road closure is a finite segment, not a nine-metre-deep slab.
      * Entering beside its far side must not teleport a car under a slope. */
     World barrier={0};barrier.city.mode=MODE_RACE_EVENT;barrier.city.nbar=1;
