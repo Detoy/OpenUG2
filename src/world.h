@@ -325,6 +325,10 @@ int world_ride_gather(const N2Scene *scene, const float pos[3], float heading,
 float world_ground_sweep(const N2Scene *s, const float from[3],
                          const float to[3], WGroundHit *hit);
 
+/* Retract a camera sphere toward a clear anchor using actual world triangles.
+ * Two-sided, including ground/ceilings; ignores sky and glow geometry. */
+float world_camera_clip(const N2Scene *s,const float (*bounds)[4],
+                         const float anchor[3],float eye[3],float radius);
 float world_ground_z(const N2Scene *s, float x, float y, float fallback);
 void world_ground_selftest(void);
 

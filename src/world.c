@@ -1690,10 +1690,26 @@ int world_ride_gather(const N2Scene *scene,const float pos[3],float heading,
                       WGroundHit cand[4],int verdict[4]) {
     float co=cosf(heading),sn=sinf(heading);
     float down=ride?phys_ride_reach_down(ride,1.0f/60.0f):PHYS_RIDE_REACH_DOWN;
+    float seed_z=pos[2],pitch=0,roll=0;
+    if(!ride) {
+        /* Placement has no chassis plane yet. Start from a reachable centre
+           surface so a long wheelbase on a grade is not queried as level.
+           Each wheel must still find real geometry within normal travel. */
+        WGroundHit centre;
+        if(world_wheel_support(scene,pos[0],pos[1],pos[2],PHYS_RIDE_REACH_UP,
+                                down,&centre,NULL,NULL)!=WSURF_NONE &&
+           fabsf(centre.normal[2])>1e-6f) {
+            float p=-(centre.normal[0]*co+centre.normal[1]*sn)/centre.normal[2];
+            float r=(centre.normal[0]*sn-centre.normal[1]*co)/centre.normal[2];
+            if(fabsf(p)<=PHYS_RIDE_MAXTILT && fabsf(r)<=PHYS_RIDE_MAXTILT) {
+                seed_z=centre.z;pitch=p;roll=r;
+            }
+        }
+    }
     int count=0;
     for(int k=0;k<4;k++) {
         float ax=support->ax[k],ay=support->ay[k];
-        float wz=ride?phys_ride_wheel_z(ride,support,k):pos[2];
+        float wz=ride?phys_ride_wheel_z(ride,support,k):seed_z+ax*pitch+ay*roll;
         WGroundHit local;
         WGroundHit *h=hit?&hit[k]:&local;
         support->valid[k]=world_wheel_support(scene,pos[0]+co*ax-sn*ay,
@@ -1746,9 +1762,15 @@ int world_wheel_support(const N2Scene *s, float x, float y, float wheel_z,
 static void wgs_mesh(const N2Mesh *m, int mi, const float p[3], const float q[3],
                      float *best, WGroundHit *hit) {
     if (m->cat != N2_ROAD && m->cat != N2_TERRAIN) return;
+    /* Exact early-out: a hit lies on p..q AND inside the triangle, so XY
+     * bounds separated by more than float noise can never produce one. */
+    float sx0=fminf(p[0],q[0])-1e-3f, sx1=fmaxf(p[0],q[0])+1e-3f;
+    float sy0=fminf(p[1],q[1])-1e-3f, sy1=fmaxf(p[1],q[1])+1e-3f;
     for (int t=0; t+2<m->nidx; t+=3) {
         const float *a=m->verts+m->idx[t]*5, *b=m->verts+m->idx[t+1]*5,
                     *c=m->verts+m->idx[t+2]*5;
+        if ((a[0]<sx0&&b[0]<sx0&&c[0]<sx0) || (a[0]>sx1&&b[0]>sx1&&c[0]>sx1) ||
+            (a[1]<sy0&&b[1]<sy0&&c[1]<sy0) || (a[1]>sy1&&b[1]>sy1&&c[1]>sy1)) continue;
         /* Double intermediates keep centimetre-scale tests stable at city
          * coordinates thousands of metres from the origin. */
         double ex=b[0]-a[0], ey=b[1]-a[1], ez=b[2]-a[2];
@@ -1800,6 +1822,68 @@ float world_ground_sweep(const N2Scene *s, const float from[3],
             }
         }
     }
+    return best;
+}
+
+/* Finite triangle distance: plane-only queries would also block doorways. */
+static float camera_tri_distance(const float p[3],const float *a,const float *b,
+                                 const float *c) {
+    float ab[3],ac[3],n[3];
+    for(int k=0;k<3;k++){ab[k]=b[k]-a[k];ac[k]=c[k]-a[k];}
+    n[0]=ab[1]*ac[2]-ab[2]*ac[1];n[1]=ab[2]*ac[0]-ab[0]*ac[2];
+    n[2]=ab[0]*ac[1]-ab[1]*ac[0];
+    float nn=0,d=0;for(int k=0;k<3;k++){nn+=n[k]*n[k];d+=(p[k]-a[k])*n[k];}
+    if(nn<1e-16f)return INFINITY;
+    const float *v[3]={a,b,c};int inside=1;float best=INFINITY;
+    for(int e=0;e<3;e++) {
+        const float *u=v[e],*w=v[(e+1)%3];float edge[3],q[3],ee=0,t=0;
+        for(int k=0;k<3;k++){edge[k]=w[k]-u[k];q[k]=p[k]-u[k];ee+=edge[k]*edge[k];t+=q[k]*edge[k];}
+        float side=(edge[1]*q[2]-edge[2]*q[1])*n[0]+
+                   (edge[2]*q[0]-edge[0]*q[2])*n[1]+
+                   (edge[0]*q[1]-edge[1]*q[0])*n[2];
+        if(side<0)inside=0;
+        t=ee>0?fmaxf(0,fminf(1,t/ee)):0;float dd=0;
+        for(int k=0;k<3;k++){float x=q[k]-t*edge[k];dd+=x*x;}
+        best=fminf(best,dd);
+    }
+    return sqrtf(inside?d*d/nn:best);
+}
+
+float world_camera_clip(const N2Scene *s,const float (*bounds)[4],
+                         const float anchor[3],float eye[3],float radius) {
+    float delta[3],length=0,best=1;
+    for(int k=0;k<3;k++){delta[k]=eye[k]-anchor[k];length+=delta[k]*delta[k];}
+    length=sqrtf(length);
+    if(!s || length<1e-5f || radius<=0)return 1;
+    /* ponytail: reuse resident XY bounds; add a spatial index only if measured
+       camera-query cost warrants one. No separate collision mesh ownership. */
+    for(int mi=0;mi<s->count;mi++) {
+        const N2Mesh*m=&s->meshes[mi];
+        if(m->cat==N2_SKY || m->cat==N2_GLOW)continue;
+        if(bounds && (fmaxf(anchor[0],eye[0])+radius<bounds[mi][0] ||
+           fminf(anchor[0],eye[0])-radius>bounds[mi][2] ||
+           fmaxf(anchor[1],eye[1])+radius<bounds[mi][1] ||
+           fminf(anchor[1],eye[1])-radius>bounds[mi][3]))continue;
+        for(int ti=0;ti+2<m->nidx;ti+=3) {
+            const float*a=m->verts+5*m->idx[ti],*b=m->verts+5*m->idx[ti+1],*c=m->verts+5*m->idx[ti+2];
+            int outside=0;
+            for(int k=0;k<3;k++)
+                if(fmaxf(anchor[k],eye[k])+radius<fminf(a[k],fminf(b[k],c[k])) ||
+                   fminf(anchor[k],eye[k])-radius>fmaxf(a[k],fmaxf(b[k],c[k])))outside=1;
+            if(outside)continue;
+            float t=0;
+            /* Distance is 1-Lipschitz: clearance steps cannot tunnel through
+               faces, edges or corners, regardless of triangle winding. */
+            for(int it=0;it<64 && t<best;it++) {
+                float p[3];for(int k=0;k<3;k++)p[k]=anchor[k]+delta[k]*t;
+                float gap=camera_tri_distance(p,a,b,c)-radius;
+                if(gap<=.0001f){best=t;break;}
+                t+=gap/length;
+                if(it==63 && t<best)best=t; /* conservative grazing contact */
+            }
+        }
+    }
+    for(int k=0;k<3;k++)eye[k]=anchor[k]+delta[k]*best;
     return best;
 }
 
@@ -1967,6 +2051,7 @@ int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit) {
                car 1464 times on one sprint (TRN_RDP_DRAG1_01_CHOP_B1_R2 tri 40,
                nz 0.000, Z 2.12..2.22). Geometry only -- no names, no categories. */
             if (zhi - zlo < WALL_RAIL_MIN_H) continue;
+            if (phys_wall_face_height(a,b,cc) < WALL_RAIL_MIN_H) continue;
             /* nearest point on the tri's longest XY edge (its footprint line) */
             float ox,oy, best=1e30f, bx=0,by=0;
             float d0=seg_d2(pos[0],pos[1],a[0],a[1],b[0],b[1],&ox,&oy); if(d0<best){best=d0;bx=ox;by=oy;}

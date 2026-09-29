@@ -10,7 +10,37 @@ static void eq_uniform(const RProg *r, GLint loc, const float *want, int n) {
     for (int i=0; i<n; i++) assert(fabsf(got[i]-want[i]) < 1e-6f);
 }
 
+static void footprint_test(void) {
+    const float p[]={10,20,3},up[]={0,0,1};
+    /* Off-centre model bounds must rotate around the same origin as the car. */
+    const float body[]={-2,-1,0,4,1,2},bus[]={-6,-1.6f,0,6,1.6f,4};
+    for(int i=0;i<8;i++) {
+        float h=i*.785398163f,co=cosf(h),sn=sinf(h),m[16];
+        mat_car_footprint(p,h,up,body,1.1f,1.35f,.03f,m);
+        float cx=m[12]+.5f*(m[0]+m[4]),cy=m[13]+.5f*(m[1]+m[5]);
+        assert(fabsf(cx-(p[0]+co))<1e-5f && fabsf(cy-(p[1]+sn))<1e-5f);
+        assert(fabsf(m[0]*co+m[1]*sn-6.6f)<1e-5f);
+        assert(fabsf(m[4]*(-sn)+m[5]*co-2.7f)<1e-5f);
+        for(int x=0;x<2;x++)for(int y=0;y<2;y++) {
+            float bx=body[x?3:0],by=body[y?4:1];
+            float dx=p[0]+co*bx-sn*by-m[12],dy=p[1]+sn*bx+co*by-m[13];
+            float u=(dx*co+dy*sn)/6.6f,v=(-dx*sn+dy*co)/2.7f;
+            assert(u>0 && u<1 && v>0 && v<1); /* all body corners covered */
+        }
+        mat_car_footprint(p,h,up,bus,1.1f,1.35f,.03f,m);
+        assert(fabsf(hypotf(m[0],m[1])-13.2f)<1e-5f);
+    }
+    float n[]={0,-.6f,.8f},m[16];
+    mat_car_footprint(p,1.2f,n,body,1.1f,1.35f,.03f,m);
+    for(int x=0;x<2;x++)for(int y=0;y<2;y++) {
+        float distance=0;
+        for(int a=0;a<3;a++)distance+=(m[12+a]+x*m[a]+y*m[4+a]-p[a])*n[a];
+        assert(fabsf(distance-.03f)<1e-5f); /* stays just above sloped road */
+    }
+}
+
 int main(void) {
+    footprint_test();
     assert(SDL_Init(SDL_INIT_VIDEO) == 0);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
@@ -19,6 +49,23 @@ int main(void) {
     assert(win);
     SDL_GLContext ctx = SDL_GL_CreateContext(win); assert(ctx);
     RProg r = render_program(); GpuMesh quad = make_quad();
+    /* A footprint covers the body corners while still fading at its edge.
+       UV near (.89,.86) lies beyond the old oval but inside the car bounds. */
+    float clip[]={2,0,0,0,0,2,0,0,0,0,1,0,-1,-1,0,1};
+    glViewport(0,0,32,32);glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glUniformMatrix4fv(r.uMVP,1,GL_FALSE,clip);
+    glUniform1f(r.uUnlit,1);glUniform1f(r.uUseTex,0);glUniform1f(r.uAlpha,.5f);
+    glUniform1f(r.uFogDensity,0);glUniform3f(r.uColor,0,0,0);
+    for(int soft=1;soft<=2;soft++) {
+        glClearColor(1,1,1,1);glClear(GL_COLOR_BUFFER_BIT);
+        glUniform1f(r.uSoft,(float)soft);draw_gpumesh(&quad);
+        unsigned char inside[4],edge[4];
+        glReadPixels(28,27,1,1,GL_RGBA,GL_UNSIGNED_BYTE,inside);
+        glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,edge);
+        assert(soft==1?inside[0]>250:inside[0]<210);
+        assert(edge[0]>250);
+    }
     GLuint tex[2]; glGenTextures(2, tex);
     const unsigned char pixel[4] = {128,64,32,255};
     glBindTexture(GL_TEXTURE_2D, tex[0]);
@@ -71,9 +118,39 @@ int main(void) {
         else assert(out[0]>0 && out[1]>0 && out[2]>0);
         assert(glGetError()==GL_NO_ERROR);
     }
+    /* A preceding car halo/smoke draw leaves its local MVP behind. World
+       glows must remain at their authored position and add no fog rectangle. */
+    BatchedVertex bv[4]={0};uint16_t bi[]={0,1,2,0,2,3};
+    for(int i=0;i<4;i++) {
+        bv[i].pos[0]=(i==1||i==2)?1:-1;bv[i].pos[1]=i>=2?1:-1;
+        memset(bv[i].col,255,4);
+    }
+    N2Batch batch={.index_count=6,.tex=tex[0]};
+    glGenBuffers(1,&batch.vbo);glBindBuffer(GL_ARRAY_BUFFER,batch.vbo);
+    glBufferData(GL_ARRAY_BUFFER,sizeof bv,bv,GL_STATIC_DRAW);
+    glGenBuffers(1,&batch.ibo);glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,batch.ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,sizeof bi,bi,GL_STATIC_DRAW);
+    float identity[16],wrong[16];mat_trans(0,0,0,identity);mat_trans(100,100,100,wrong);
+    for(int mode=0;mode<4;mode++) {
+        unsigned char px[]={mode==2?0:128,0,0,255};
+        glBindTexture(GL_TEXTURE_2D,tex[0]);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,px);
+        glDepthMask(GL_TRUE);glClearDepth(mode==1?0:1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        glDisable(GL_DEPTH_TEST);glUniformMatrix4fv(r.uMVP,1,GL_FALSE,wrong);
+        render_model(&r,wrong);glUniform1f(r.uAlpha,0);glUniform1f(r.uSoft,1);
+        const float fog[]={.3f,.2f,.1f};glUniform3fv(r.uFogColor,1,fog);
+        glUniform1f(r.uFogDensity,mode==2?1:0);batch.unresolved=mode==3;
+        assert(render_world_glows(&r,&batch,1,identity)==(mode==3?0:1));
+        eq_uniform(&r,r.uMVP,identity,16);eq_uniform(&r,r.uFogColor,fog,3);
+        unsigned char out[4];glReadPixels(16,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,out);
+        if(mode==0)assert(out[0]>100 && out[1]==0 && out[2]==0);
+        else assert(out[0]==0 && out[1]==0 && out[2]==0);
+        assert(glGetError()==GL_NO_ERROR);
+    }
+    glDeleteBuffers(1,&batch.vbo);glDeleteBuffers(1,&batch.ibo);
     glDeleteTextures(2,tex); glDeleteProgram(r.prog);
     glDeleteBuffers(1,&quad.vbo); glDeleteBuffers(1,&quad.nbo); glDeleteBuffers(1,&quad.ibo);
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
-    puts("light_state_test: PASS (state isolation, depth occlusion, distance culling, additive fog)");
+    puts("light_state_test: PASS (vehicle footprints, soft shadow coverage, state isolation, depth occlusion, distance culling, additive fog, world-glow transform isolation)");
     return 0;
 }

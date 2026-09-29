@@ -664,7 +664,14 @@ static int n2_scen_class(const char *nm) {
     if (!nm || !nm[0]) return N2_SC_NONE;
     if (!strncmp(nm, "TRN", 3) || !strncmp(nm, "PAN", 3)) return N2_SC_TERRAIN;
     if (!strncmp(nm, "XB",  2)) return N2_SC_BUILDING;   /* buildings/barriers */
-    if (!strncmp(nm, "XO",  2)) return N2_SC_PROP;       /* poles, cans, barrels */
+    if (!strncmp(nm, "XO", 2)) {
+        /* Authored obstacle roles also occur in the object family. Do not
+           confuse wall-mounted lights with the walls they illuminate. */
+        if (strstr(nm,"GUARD") || strstr(nm,"BARRIER") || strstr(nm,"FENCE") ||
+            strstr(nm,"RAILING") || (strstr(nm,"WALL") && !strstr(nm,"LIGHT")))
+            return N2_SC_WALL;
+        return N2_SC_PROP;                             /* poles, cans, barrels */
+    }
     if (!strncmp(nm, "XT",  2)) return N2_SC_TREE;
     if (!strncmp(nm, "XW",  2)) return N2_SC_WALL;       /* walls / fences */
     if (!strncmp(nm, "XS",  2) || !strncmp(nm, "XV", 2)) return N2_SC_STRUCT;

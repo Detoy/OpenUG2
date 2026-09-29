@@ -10,6 +10,9 @@
 #include "world.h"     /* grid-accelerated ground query */
 #include "ground_motion.h"
 
+AiPerf g_ai_perf;
+AiAuditHook g_ai_audit_hook;
+
 static void ai_motion_init(AiCar *car,const AiTrafficWorld *world) {
     car->vel[0]=cosf(car->head)*car->spd;car->vel[1]=sinf(car->head)*car->spd;
     car->steer=0;
@@ -55,10 +58,12 @@ static void ai_vehicle_step(AiCar *car,float throttle,float steer,int handbrake,
         float hw=car->half_width>.5f?car->half_width:1.0f;
         float height=car->height>1?car->height:1.6f;
         float bb[6]={-hl,-hw,0,hl,hw,height};
-        if(world->obst && world->obstsrc)
+        if(world->obst && world->obstsrc) {
+            g_ai_perf.wall_candidates+=world->nobst;
             collide_body_walls(car->pos,car->vel,car->head,bb,world->obst,
                 world->obstz,world->nobst,car->pos[2]+.05f,car->pos[2]+height,
                 scene,world->obstsrc,NULL,0);
+        }
         world_body_wall_push(scene,car->pos,car->vel,car->head,bb,
                              car->pos[2]+.05f,car->pos[2]+height,NULL);
         world_ride_gather(scene,car->pos,car->head,car->vel,oldh,&car->ride,
@@ -66,7 +71,7 @@ static void ai_vehicle_step(AiCar *car,float throttle,float steer,int handbrake,
     }
     float co=cosf(car->head),sn=sinf(car->head);
     car->spd=car->vel[0]*co+car->vel[1]*sn;
-    phys_ride_apply_load(&car->ride,vehicle,ax*co+ay*sn,-ax*sn+ay*co,1.0f/60.0f);
+    phys_ride_lean(&car->ride,vehicle,-ax*sn+ay*co,1.0f/60.0f);
     phys_ride_step(&car->ride,&car->support,1.0f/60.0f);
     car->pos[2]=car->ride.z;
     car->turn_rate=atan2f(sinf(car->head-oldh),cosf(car->head-oldh));
@@ -76,6 +81,116 @@ static float ai_throttle(float target,float speed) {
     float delta=(target-speed)*PHYS_TICKRATE;
     if(delta<0 && speed>0.002f)return fmaxf(-1.0f,delta*.8f);
     return fmaxf(0.0f,fminf(1.0f,delta*.5f));
+}
+
+static void ai_contact_bounds(const AiCar *car,float bb[6]) {
+    float hl=car->half_length>1?car->half_length:2.2f;
+    float hw=car->half_width>.5f?car->half_width:1.0f;
+    float height=car->height>1?car->height:1.6f;
+    bb[0]=-hl;bb[1]=-hw;bb[2]=0;bb[3]=hl;bb[4]=hw;bb[5]=height;
+}
+
+static void ai_contact_world(AiCar *car,const float old[3],const AiTrafficWorld *world) {
+    if(!world || !world->scene)return;
+    float bb[6];ai_contact_bounds(car,bb);
+    float dx=car->pos[0]-old[0],dy=car->pos[1]-old[1];
+    int steps=1+(int)ceilf(hypotf(dx,dy)/.25f);
+    car->pos[0]=old[0];car->pos[1]=old[1];
+    /* Short correction steps cannot skip across a thin wall to its far side.
+       This constrains penetration correction, not the normal driving tick. */
+    for(int i=0;i<steps;i++) {
+        float before[3]={car->pos[0],car->pos[1],car->pos[2]},head=car->head;
+        car->pos[0]+=dx/steps;car->pos[1]+=dy/steps;
+        if(car->ride_ready)
+            ground_motion_limit(world->scene,&car->ride,&car->support,before,head,
+                                car->pos,&head,car->vel,NULL);
+        g_ai_perf.world_fixes++;
+        if(world->obst && world->obstsrc) g_ai_perf.wall_candidates+=world->nobst;
+        if(world->obst && world->obstsrc)
+            collide_body_walls(car->pos,car->vel,car->head,bb,world->obst,world->obstz,
+                world->nobst,car->pos[2]+.05f,car->pos[2]+bb[5],
+                world->scene,world->obstsrc,NULL,0);
+        world_body_wall_push(world->scene,car->pos,car->vel,car->head,bb,
+                             car->pos[2]+.05f,car->pos[2]+bb[5],NULL);
+    }
+}
+
+static float ai_car_contact(AiCar *a,AiCar *b,const AiTrafficWorld *world) {
+    float bb[6];ai_contact_bounds(a,bb);
+    float thud=0;
+    /* Recheck this pair after the world blocks a separation correction. */
+    for(int pass=0;pass<8;pass++) {
+        float olda[3]={a->pos[0],a->pos[1],a->pos[2]};
+        float oldb[3]={b->pos[0],b->pos[1],b->pos[2]};
+        float hit=phys_car_contacts(a->pos,a->vel,a->spd,a->head,bb,a->mass,b,1);
+        g_ai_perf.pairs++;
+        if(!hit)break;
+        g_ai_perf.hits++;
+        thud=fmaxf(thud,hit);
+        float targeta[3]={a->pos[0],a->pos[1],a->pos[2]};
+        float targetb[3]={b->pos[0],b->pos[1],b->pos[2]};
+        float nx=targetb[0]-oldb[0],ny=targetb[1]-oldb[1],len=hypotf(nx,ny);
+        ai_contact_world(a,olda,world);ai_contact_world(b,oldb,world);
+        if(len>1e-6f) {
+            nx/=len;ny/=len;
+            float blocked_a=fmaxf(0,(a->pos[0]-targeta[0])*nx+(a->pos[1]-targeta[1])*ny);
+            float blocked_b=fmaxf(0,(targetb[0]-b->pos[0])*nx+(targetb[1]-b->pos[1])*ny);
+            /* A wall-backed car cannot accept its share of the correction.
+               Give the remainder to the other body, independent of mass. */
+            memcpy(olda,a->pos,sizeof olda);memcpy(oldb,b->pos,sizeof oldb);
+            a->pos[0]-=blocked_b*nx;a->pos[1]-=blocked_b*ny;
+            b->pos[0]+=blocked_a*nx;b->pos[1]+=blocked_a*ny;
+            float closing=(a->vel[0]-b->vel[0])*nx+(a->vel[1]-b->vel[1])*ny;
+            if(closing>0) {
+                if(blocked_b>.00001f){a->vel[0]-=closing*nx;a->vel[1]-=closing*ny;}
+                else if(blocked_a>.00001f){b->vel[0]+=closing*nx;b->vel[1]+=closing*ny;}
+            }
+            if(blocked_b>0)ai_contact_world(a,olda,world);
+            if(blocked_a>0)ai_contact_world(b,oldb,world);
+        }
+    }
+    if(!thud)return 0;
+    a->spd=a->vel[0]*cosf(a->head)+a->vel[1]*sinf(a->head);
+    b->spd=b->vel[0]*cosf(b->head)+b->vel[1]*sinf(b->head);
+    return thud;
+}
+
+float ai_car_contacts(AiCar *const cars[],int count,const AiTrafficWorld *world,
+                       const AiCar *player) {
+    float thud=0;int touched=0;
+    /* ponytail: bounded all-pairs relaxation for the local vehicle pool. Use
+       contact islands if traffic grows; impossible enclosures stay bounded. */
+    int passes=8*count*count; /* longer queues need more separation sweeps */
+    if(passes<256)passes=256;
+    for(int pass=0;pass<passes;pass++) {
+        int contacts=0;g_ai_perf.passes++;
+        for(int i=0;i<count;i++)for(int j=i+1;j<count;j++) {
+            float hit=ai_car_contact(cars[i],cars[j],world);
+            if(hit) {
+                contacts=1;touched=1;
+                if(cars[i]==player || cars[j]==player)thud=fmaxf(thud,hit);
+            }
+        }
+        if(!contacts)break;
+    }
+    if(!touched)return 0;
+    for(int k=0;k<count;k++) {
+        AiCar *car=cars[k];
+        car->spd=car->vel[0]*cosf(car->head)+car->vel[1]*sinf(car->head);
+        if(!world || !world->scene || !car->ride_ready)continue;
+        world_ride_gather(world->scene,car->pos,car->head,car->vel,car->head,
+                         &car->ride,&car->support,NULL,NULL,NULL);
+        /* Refresh the displaced wheel footprint without a second gravity or
+           spring tick. Newly reached support is resolved on the next tick. */
+        for(int w=0;w<4;w++) {
+            float c=car->support.z[w]-phys_ride_wheel_z(&car->ride,&car->support,w);
+            if(!car->support.valid[w]) {
+                car->ride.contact_mask&=~(1u<<w);c=-PHYS_RIDE_DROOP;
+            }
+            car->ride.compression[w]=fmaxf(-PHYS_RIDE_DROOP,fminf(PHYS_RIDE_BUMP,c));
+        }
+    }
+    return thud;
 }
 
 static int ai_load_loop(const char *dataroot, const char *circuit, N2Path *aipath) {
@@ -182,6 +297,8 @@ void ai_step(AiCar *ai, int k, const N2Path *aipath, N2Scene *scene,
 void ai_roads_free(AiRoadNet *roads) {
     if(!roads)return;
     free(roads->xy);free(roads->next);free(roads->half_width);
+    free(roads->pred_start);free(roads->pred_list);
+    free(roads->cell_start);free(roads->cell_list);
     memset(roads,0,sizeof *roads);
 }
 
@@ -244,7 +361,76 @@ int ai_roads_load(AiRoadNet *roads,const char *troot) {
     for(int f=0;f<nf;f++)free(files[f]);free(files);
     printf("free-roam road paths: %d nodes from %d RoutesFreeRoam.bin files\n",
            roads->n,nfiles);
+    if(roads->n>0 && !ai_roads_index(roads))printf("road query index: unavailable, linear scans\n");
     return roads->n;
+}
+
+/* traffic_next only considers edges whose start is `at` (authored pass) or
+ * whose endpoint lies within 65 m of `at` (junction pass: gap <= 5 m on an
+ * edge <= 60 m). The grid cell is wider than that, so a 3x3 neighbourhood is
+ * a superset; candidates are visited in ascending index like the linear scan. */
+#define AI_ROAD_CELL 70.0f
+int ai_roads_index(AiRoadNet *r) {
+    if(!r || r->n<=0 || !r->xy || !r->next)return 0;
+    float x0=1e30f,y0=1e30f,x1=-1e30f,y1=-1e30f;
+    for(int i=0;i<r->n;i++) {
+        x0=fminf(x0,r->xy[i*2]);x1=fmaxf(x1,r->xy[i*2]);
+        y0=fminf(y0,r->xy[i*2+1]);y1=fmaxf(y1,r->xy[i*2+1]);
+    }
+    int gw=1+(int)((x1-x0)/AI_ROAD_CELL),gh=1+(int)((y1-y0)/AI_ROAD_CELL);
+    if(gw<=0||gh<=0||(long)gw*gh>(1L<<22))return 0;
+    int *ps=calloc((size_t)r->n+1,sizeof *ps),*pl=malloc((size_t)r->n*sizeof *pl);
+    int *cs=calloc((size_t)gw*gh+1,sizeof *cs),*cl=malloc((size_t)r->n*sizeof *cl);
+    if(!ps||!pl||!cs||!cl){free(ps);free(pl);free(cs);free(cl);return 0;}
+    for(int i=0;i<r->n;i++) {
+        int nx=r->next[i];if(nx>=0 && nx<r->n)ps[nx+1]++;
+        int cx=(int)((r->xy[i*2]-x0)/AI_ROAD_CELL),cy=(int)((r->xy[i*2+1]-y0)/AI_ROAD_CELL);
+        cs[cy*gw+cx+1]++;
+    }
+    for(int i=0;i<r->n;i++)ps[i+1]+=ps[i];
+    for(int c=0;c<gw*gh;c++)cs[c+1]+=cs[c];
+    int *pf=malloc((size_t)r->n*sizeof *pf),*cf=malloc((size_t)gw*gh*sizeof *cf);
+    if(!pf||!cf){free(pf);free(cf);free(ps);free(pl);free(cs);free(cl);return 0;}
+    memcpy(pf,ps,(size_t)r->n*sizeof *pf);memcpy(cf,cs,(size_t)gw*gh*sizeof *cf);
+    for(int i=0;i<r->n;i++) {   /* ascending i keeps every list sorted */
+        int nx=r->next[i];if(nx>=0 && nx<r->n)pl[pf[nx]++]=i;
+        int cx=(int)((r->xy[i*2]-x0)/AI_ROAD_CELL),cy=(int)((r->xy[i*2+1]-y0)/AI_ROAD_CELL);
+        cl[cf[cy*gw+cx]++]=i;
+    }
+    free(pf);free(cf);
+    free(r->pred_start);free(r->pred_list);free(r->cell_start);free(r->cell_list);
+    r->pred_start=ps;r->pred_list=pl;r->cell_start=cs;r->cell_list=cl;
+    r->gw=gw;r->gh=gh;r->gx0=x0;r->gy0=y0;
+    return 1;
+}
+
+static int ai_int_cmp(const void *a,const void *b) {
+    int x=*(const int *)a,y=*(const int *)b;return (x>y)-(x<y);
+}
+/* Sorted candidate node indices for traffic_next's pass, or -1 = scan all. */
+static int ai_road_candidates(const AiRoadNet *r,int at,int pass,int *out,int cap) {
+    if(!r->pred_start || !r->cell_start)return -1;
+    int n=0;
+    if(pass==0) {
+        out[n++]=at;
+        for(int k=r->pred_start[at];k<r->pred_start[at+1];k++) {
+            if(n>=cap)return -1;
+            out[n++]=r->pred_list[k];
+        }
+    } else {
+        int cx=(int)((r->xy[at*2]-r->gx0)/AI_ROAD_CELL),cy=(int)((r->xy[at*2+1]-r->gy0)/AI_ROAD_CELL);
+        for(int y=cy-1;y<=cy+1;y++)for(int x=cx-1;x<=cx+1;x++) {
+            if(x<0||y<0||x>=r->gw||y>=r->gh)continue;
+            int c=y*r->gw+x;
+            for(int k=r->cell_start[c];k<r->cell_start[c+1];k++) {
+                if(n>=cap)return -1;
+                out[n++]=r->cell_list[k];
+            }
+        }
+    }
+    qsort(out,(size_t)n,sizeof *out,ai_int_cmp);
+    int u=0;for(int k=0;k<n;k++)if(!u||out[k]!=out[u-1])out[u++]=out[k];
+    return u;
 }
 
 static int traffic_edge_supported(N2Scene *scene,float x,float y,float dx,float dy,float z) {
@@ -301,8 +487,9 @@ static int traffic_pose_clear(const AiTrafficWorld *world,const AiCar *car,
     return !world_body_wall_push(scene,pos,vel,heading,bb,z+0.05f,z+height,NULL);
 }
 
-/* Keep going along the authored path. At its end, join another directed path
- * whose start is within five metres and best preserves the incoming heading. */
+/* Join nearby road segments, including the middle of an edge. Stored point
+ * order is not a decoded one-way rule; incoming heading selects travel direction.
+ * ponytail: geometric junction policy until source lane/direction flags are known. */
 static int traffic_next(const AiRoadNet *roads,N2Scene *scene,int at,int previous,float z) {
     if(!roads || at<0 || at>=roads->n)return -1;
     const float *xy=roads->xy;
@@ -313,20 +500,41 @@ static int traffic_next(const AiRoadNet *roads,N2Scene *scene,int at,int previou
         float len=hypotf(hx,hy);if(len>0.01f){hx/=len;hy/=len;}
     }
     int best=-1;float score=-1e30f;
-    for(int i=0;i<roads->n;i++) {
-        int nb=roads->next[i];
-        if(nb<0 || nb==previous)continue;
-        float gap=hypotf(xy[i*2]-xy[at*2],xy[i*2+1]-xy[at*2+1]);
-        if(gap>5.0f)continue;
-        float dx=xy[nb*2]-xy[at*2],dy=xy[nb*2+1]-xy[at*2+1];
-        float len=hypotf(dx,dy);
-        if(len<1.0f || len>60.0f)continue;
-        if(previous>=0 && (dx*hx+dy*hy)/len<-0.15f)continue;
-        if(!traffic_edge_supported(scene,xy[at*2],xy[at*2+1],dx,dy,z))continue;
-        float s=previous<0? -gap : (dx*hx+dy*hy)/len-gap*0.02f;
-        if(s>score){score=s;best=nb;}
+    /* Preserve the authored chain before considering nearby junctions. A
+       straighter overlapping branch must not steal a car halfway round a bend. */
+    static int cand[4096];
+    for(int pass=0;pass<2 && best<0;pass++) {
+      int nc=ai_road_candidates(roads,at,pass,cand,4096);
+      for(int ci=0;ci<(nc<0?roads->n:nc);ci++) {
+        int i=nc<0?ci:cand[ci];
+        int next=roads->next[i];if(next<0)continue;
+        for(int reverse=0;reverse<2;reverse++) {
+            int start=reverse?next:i,nb=reverse?i:next;
+            if(pass==0 && start!=at)continue;
+            if(nb==at || nb==previous)continue;
+            float ex=xy[nb*2]-xy[start*2],ey=xy[nb*2+1]-xy[start*2+1];
+            float edge=hypotf(ex,ey);
+            if(edge<1.0f || edge>60.0f)continue;
+            if(previous>=0 && (ex*hx+ey*hy)/edge<-0.15f)continue;
+            float t=((xy[at*2]-xy[start*2])*ex+(xy[at*2+1]-xy[start*2+1])*ey)/(edge*edge);
+            t=fmaxf(0,fminf(1,t));
+            float gap=hypotf(xy[start*2]+ex*t-xy[at*2],xy[start*2+1]+ey*t-xy[at*2+1]);
+            if(gap>5.0f)continue;
+            float dx=xy[nb*2]-xy[at*2],dy=xy[nb*2+1]-xy[at*2+1];
+            float len=hypotf(dx,dy);
+            if(len<1.0f || len>60.0f)continue;
+            if(previous>=0 && (dx*hx+dy*hy)/len<-0.15f)continue;
+            if(!traffic_edge_supported(scene,xy[at*2],xy[at*2+1],dx,dy,z))continue;
+            float s=previous<0? -gap : (dx*hx+dy*hy)/len-gap*0.02f;
+            if(s>score){score=s;best=nb;}
+        }
+      }
     }
     return best; /* no authored continuation: despawn off-screen instead of a U-turn */
+}
+
+int ai_road_next(const AiRoadNet *roads,N2Scene *scene,int at,int previous,float z) {
+    return traffic_next(roads,scene,at,previous,z);
 }
 
 static float traffic_corner_trim(const AiRoadNet *roads,int before,int corner,int after) {
@@ -421,8 +629,8 @@ int ai_traffic_offscreen(const float eye[3],const float view[2],const float pos[
 }
 
 void ai_traffic_follow(AiCar cars[N_OPENWORLD_AI], const AiTraffic routes[N_OPENWORLD_AI],
-                       const AiRoadNet *roads, int k, int count) {
-    /* ponytail: six-car local gap model; use decoded lane/signal rules if found. */
+                       const AiRoadNet *roads, int k, int count, const AiCar *player) {
+    /* ponytail: local gap model; use decoded lane/signal rules if found. */
     if(k<0 || k>=count || routes[k].to<0)return;
     AiCar *car=&cars[k];
     float fx=cosf(car->head),fy=sinf(car->head);
@@ -435,16 +643,18 @@ void ai_traffic_follow(AiCar cars[N_OPENWORLD_AI], const AiTraffic routes[N_OPEN
                             roads->xy[2*to+1]-roads->xy[2*from+1]);
         target=fminf(target,sqrtf(8.0f*fmaxf(0.0f,length-routes[k].along-1.0f)));
     }
-    for(int j=0;j<count;j++)if(j!=k && routes[j].present) {
-        const AiCar *lead=&cars[j];
-        if(fabsf(car->pos[2]-lead->pos[2])>2.5f ||
-           fx*cosf(lead->head)+fy*sinf(lead->head)<0.8f)continue;
+    for(int j=0;j<count+(player!=NULL);j++)if(j!=k && (j==count || routes[j].present)) {
+        const AiCar *lead=j==count?player:&cars[j];
+        if(fabsf(car->pos[2]-lead->pos[2])>2.5f)continue;
+        float alignment=cosf(lead->head-car->head),cross=sinf(lead->head-car->head);
+        float lead_length=lead->half_length*fabsf(alignment)+lead->half_width*fabsf(cross);
+        float lead_width=lead->half_width*fabsf(alignment)+lead->half_length*fabsf(cross);
         float dx=lead->pos[0]-car->pos[0],dy=lead->pos[1]-car->pos[1];
         float ahead=dx*fx+dy*fy;
         if(ahead<=0 || ahead>100.0f ||
-           fabsf(dx*fy-dy*fx)>car->half_width+lead->half_width+0.5f)continue;
-        float gap=ahead-car->half_length-lead->half_length;
-        float relative=fmaxf(0.0f,speed-lead->spd*PHYS_TICKRATE);
+           fabsf(dx*fy-dy*fx)>car->half_width+lead_width+0.5f)continue;
+        float gap=ahead-car->half_length-lead_length;
+        float relative=fmaxf(0.0f,speed-lead->spd*alignment*PHYS_TICKRATE);
         float braking=relative*relative/(2.0f*4.0f);
         float safe=fmaxf(0.0f,(gap-6.0f-braking)/1.5f);
         if(safe<target)target=safe;
@@ -459,7 +669,7 @@ int ai_traffic_respawn(const AiRoadNet *roads, const AiTrafficWorld *world,
     if(!roads || !roads->xy || !roads->next || !player || k<0 || k>=N_OPENWORLD_AI)return 0;
     N2Scene *scene=world?world->scene:NULL;
     unsigned attempt=routes[k].respawns;
-    const float angle=0.4f+(float)k*6.2831853f/N_OPENWORLD_AI+0.5f*(attempt%6);
+    const float angle=0.4f+(float)k*6.2831853f/N_ROAM_VISUALS+0.5f*(attempt%6);
     const float radius=85.0f+20.0f*(attempt%3);
     const float tx=player[0]+cosf(angle)*radius,ty=player[1]+sinf(angle)*radius;
     float fx=cosf(player_heading),fy=sinf(player_heading);
@@ -496,8 +706,8 @@ int ai_traffic_respawn(const AiRoadNet *roads, const AiTrafficWorld *world,
         if(run<25.0f)continue;
         float lx,ly,lz;
         traffic_lane_tangent(roads,scene,i,next,0,x,y,z,atan2f(dy,dx),&lx,&ly,&lz);
-        if(!traffic_pose_clear(world,&cars[k],lx,ly,lz,atan2f(dy,dx)) ||
-           !traffic_spawn_run_clear(roads,world,&cars[k],i,next,lz))continue;
+        /* Pure filters: the cheap separation test runs before the costly
+           clearance sweeps; the accepted candidate is unchanged. */
         int occupied=0;
         for(int j=0;j<N_OPENWORLD_AI;j++)if(j!=k && routes[j].present &&
            fabsf(lz-cars[j].pos[2])<3.0f) {
@@ -506,6 +716,8 @@ int ai_traffic_respawn(const AiRoadNet *roads, const AiTrafficWorld *world,
             if(sep<(same>0.8f?40.0f:22.0f))occupied=1;
         }
         if(occupied)continue;
+        if(!traffic_pose_clear(world,&cars[k],lx,ly,lz,atan2f(dy,dx)) ||
+           !traffic_spawn_run_clear(roads,world,&cars[k],i,next,lz))continue;
         best=i;to=next;bz=z;score=s;
     }
     }
@@ -522,16 +734,42 @@ int ai_traffic_respawn(const AiRoadNet *roads, const AiTrafficWorld *world,
         atan2f(dy,dx),
         &car->pos[0],&car->pos[1],&car->pos[2]);
     car->head=atan2f(dy,dx);
-    car->spd=(k<N_AI ? 26.0f+3.0f*k : 75.0f+5.0f*(k-N_AI))/3.6f/PHYS_TICKRATE;
+    car->spd=(ai_traffic_is_racer(k) ? 75.0f+5.0f*(k-N_AI) : 26.0f+3.0f*(k%N_AI))/3.6f/PHYS_TICKRATE;
     routes[k].cruise_speed=car->spd;
     car->spd=fminf(car->spd,traffic_turn_speed(roads,&routes[k])/PHYS_TICKRATE);
     car->target_speed=car->spd;car->ride_ready=0;
     ai_motion_init(car,world);
     car->wheel_angle=car->turn_rate=0;car->braking=0;car->lap=car->prevrel=car->t=0;
-    static const float colors[N_OPENWORLD_AI][3]={{.65f,.7f,.8f},{.2f,.55f,.3f},
+    static const float colors[N_ROAM_VISUALS][3]={{.65f,.7f,.8f},{.2f,.55f,.3f},
         {.8f,.65f,.3f},{.6f,.35f,.3f},{.95f,.2f,.12f},{.1f,.5f,.95f}};
-    memcpy(car->col,colors[k],sizeof car->col);
+    memcpy(car->col,colors[ai_traffic_visual(k)],sizeof car->col);
     return 1;
+}
+
+static int traffic_slot_wanted(int k,const AiTrafficWorld *world) {
+    int target=world?world->traffic_target:N_AI;
+    if(target<0)target=0;if(target>N_TRAFFIC_MAX)target=N_TRAFFIC_MAX;
+    return ai_traffic_is_racer(k) || (k<N_AI?k:k-2)<target;
+}
+
+int ai_traffic_update(const AiRoadNet *roads,const AiTrafficWorld *world,
+                       AiCar cars[N_OPENWORLD_AI],AiTraffic routes[N_OPENWORLD_AI],
+                       const float player[3],float heading) {
+    int candidate=-1;
+    for(int k=0;k<N_OPENWORLD_AI;k++) {
+        int wanted=traffic_slot_wanted(k,world);
+        int offscreen=!world || ai_traffic_offscreen(world->eye,world->view,cars[k].pos);
+        if(routes[k].present && offscreen && (!wanted || routes[k].to<0 ||
+           hypotf(cars[k].pos[0]-player[0],cars[k].pos[1]-player[1])>420)) {
+            routes[k].present=0;routes[k].to=-1;
+            cars[k].spd=cars[k].vel[0]=cars[k].vel[1]=0;
+        }
+        /* Fewest attempts first prevents an impossible slot starving others. */
+        if(wanted && !routes[k].present && (candidate<0 ||
+           routes[k].respawns<routes[candidate].respawns))candidate=k;
+    }
+    if(candidate>=0)ai_traffic_respawn(roads,world,cars,routes,candidate,player,heading);
+    return N_OPENWORLD_AI;
 }
 
 int ai_traffic_spawn(const AiRoadNet *roads, const AiTrafficWorld *world,
@@ -543,8 +781,8 @@ int ai_traffic_spawn(const AiRoadNet *roads, const AiTrafficWorld *world,
         routes[k].prev=routes[k].from=routes[k].to=routes[k].after=-1;
     int count=0;
     for(int k=0;k<N_OPENWORLD_AI;k++) {
-        if(!ai_traffic_respawn(roads,world,cars,routes,k,player,player_heading))break;
-        count++;
+        if(traffic_slot_wanted(k,world) &&
+           ai_traffic_respawn(roads,world,cars,routes,k,player,player_heading))count=k+1;
     }
     return count;
 }

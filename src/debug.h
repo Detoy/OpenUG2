@@ -86,9 +86,14 @@ typedef struct {
 } VehicleWheelConfig;
 
 typedef struct {
-    /* --- freecam (works in every build; toggle with F) --- */
+    /* --- car orbit (RMB hold, F latch; works in every build) --- */
     int   freecam;
-    float speed;                 /* freecam move units/frame */
+    float speed;                 /* reserved legacy inspector value */
+
+    int traffic_target, traffic_max; /* requested ambient count; engine limit */
+    int traffic_active, traffic_racers, traffic_available; /* live readouts */
+    int traffic_cull_off; /* diagnostic: draw every AI car even when outside the view */
+    int traffic_visible;  /* live readout: AI cars that passed the view test */
 
     /* --- chase camera (3rd-person follow): ideal pos = car - forward*distance
        + up*height; actual pos and look-target ease toward their ideals by
@@ -241,7 +246,7 @@ typedef struct {
     char  scen_near[12][40];    /* "NAME  [CLASS]  d=..m" rows */
 
     /* --- placement marking (engine writes each frame; Placement Marks tab
-           captures it). The probe follows the car, or the camera in freecam,
+           captures it). The probe follows the car,
            so a mark carries the surface it was taken on and not just an XY. --- */
     float probe[3];             /* world point a mark would capture */
     float probe_ground_z;       /* ground selector result under probe */
