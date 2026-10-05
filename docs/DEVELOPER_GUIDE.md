@@ -815,8 +815,12 @@ The old player path assigned centre ground Z directly each frame. Current flow:
 6. render the body from sprung heave, pitch and roll.
 
 A triangle covering XY is only a candidate. It is contact only inside the
-wheel's reach window. The nearest candidate by absolute Z distance wins; a deck
-metres above the car is never support. With no contacts, gravity integrates and
+wheel's reach window. A reachable rising ramp inside its actual triangle takes
+priority over an overlapping lower floor. Flat layers, steep side faces and
+extrapolated seams keep nearest-contact selection; a deck metres above the car
+is never support. Reachable face gradients also permit the ride to follow an
+authored incline beyond its generic tilt guard when at least two tyres carry
+load. With no contacts, gravity integrates and
 `air_frames` grows. Do not add a multi-metre “recovery” reach to hide a bad
 spawn or layer transition.
 
@@ -873,10 +877,12 @@ the suspension, or change the corridor/AI collision shapes. Sequential
 contacts can still pin a vehicle against multiple faces; a supported wheel
 mask is not proof of a playable route or an unobstructed chase camera.
 
-`world_body_wall_push` handles near-vertical road/terrain guardrail faces using
-the same oriented body capsule and face-local velocity response. Its measured
-0.75–2.5 m face-height band rejects surface seams and tall terrain walls.
-`world_wall_push` remains the circle helper for spawn probes;
+`world_body_wall_push` handles near-vertical road/terrain walls and guardrails using
+the same oriented body capsule and face-local velocity response. The 0.75 m
+minimum face thickness rejects seams and sloping curbs. Tall retaining faces
+also block when they overlap the body's actual height; the legacy rail census
+ceiling does not apply to gameplay. `world_wall_clear_at` uses the same faces
+for spawn probes; `world_wall_push` remains the legacy low-rail diagnostic.
 `world_barrier_push` is race-corridor closure. These predicates still have
 separate ownership, so a threshold proven for one is not automatically valid
 for another.

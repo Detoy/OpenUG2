@@ -43,6 +43,8 @@ typedef struct {
     float (*obstacle_z)[2];
     int *obstacle_src;
     int obstacle_count;
+    int collision_mesh;       /* next source mesh in the detached collision scan */
+    uint64_t collision_ticks;
     WorldBatchUpload *upload;  /* owns partial ordinary batches until complete */
     WTextureBind texture_binding;
     uint64_t texture_ticks;
@@ -97,7 +99,8 @@ int world_resident_prepare(WorldResident *candidate, const WResidentBuildArgs *a
 int world_resident_finish(WorldResident *candidate, float x, float y, float z,
                           WResidentBuildTiming *timing);
 /* Background finish: 0 pending, 1 complete, -1 failed. Retains partial resources
- * in candidate; free safely on cancellation. Check CURRENT support on the last
+ * in candidate; free safely on cancellation. The quota also bounds collision
+ * scanning to 16 source meshes per batch allowance. Check CURRENT support on the last
  * step as well as validating the detached scene before the first upload. */
 int world_resident_finish_step(WorldResident *candidate, float x, float y, float z,
                           int max_batches, WResidentBuildTiming *timing);

@@ -1629,7 +1629,7 @@ static int wg_at(const N2Scene *s, float x, float y, float fallback,
     return wg_pick(&sub, srcmap, x, y, refz, outz, outn, hit);
 }
 
-/* ROAD/TERRAIN triangle covering (x,y) and CLOSEST to wz inside [wz-down,
+/* Reachable ROAD/TERRAIN contact covering (x,y) inside [wz-down,
    wz+up]. Same coverage test and the same grid fast path as wg_pick; only the
    acceptance rule differs, so this cannot select a surface the wheel cannot
    reach. The nearest covering triangle overall is recorded separately in
@@ -1637,7 +1637,7 @@ static int wg_at(const N2Scene *s, float x, float y, float fallback,
 static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
                     float wz, float up, float down, WGroundHit *hit,
                     WGroundHit *nearest, float *neard) {
-    int bestcat = WSURF_NONE; float bestad = 1e30f;
+    int bestcat = WSURF_NONE; float bestkey = 1e30f;
     for (int m = 0; m < s->count; m++) {
         int mc = s->meshes[m].cat;
         if (mc != N2_ROAD && mc != N2_TERRAIN) continue;
@@ -1662,19 +1662,21 @@ static int wws_pick(const N2Scene *s, const int *srcmap, float x, float y,
                                nearest->normal[0]=0; nearest->normal[1]=0; nearest->normal[2]=1; }
             }
             if (dz > up || dz < -down) continue;     /* candidate, not contact */
-            /* Among reachable candidates the CLOSEST wins: continuity, so the
-               surface the wheel is already riding (0 m away) always beats one
-               stacked above it. The window above is what refuses a deck the
-               wheel cannot reach; this tie-break is not load-bearing for that. */
-            if (bestcat != WSURF_NONE && ad >= bestad) continue;
-            bestcat = cat; bestad = ad;
+            /* Prefer a rising ramp over its overlapping baked floor, only
+               inside the actual face and within unchanged upward travel.
+               Flat stacked layers and extrapolated mesh seams keep nearest
+               contact selection, including the existing landing response. */
+            float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2];
+            float e2x=c[0]-a[0],e2y=c[1]-a[1],e2z=c[2]-a[2];
+            float nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+            float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+            int ramp = fabsf(nz)>=.30f*nl && fabsf(nx)+fabsf(ny)>fabsf(nz)*.005f;
+            float key=dz>0 && ramp && u>=0 && v>=0 && w>=0 ? -dz : ad;
+            if (bestcat != WSURF_NONE && key >= bestkey) continue;
+            bestcat = cat; bestkey = key;
             if (hit) {
                 hit->mesh = srcmap ? srcmap[m] : m; hit->tri = t/3;
                 hit->cat = cat; hit->z = z;
-                float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
-                float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
-                float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
-                float nl=sqrtf(nx*nx+ny*ny+nz*nz);
                 if (nl > 1e-9f) { if (nz < 0) { nx=-nx; ny=-ny; nz=-nz; }
                                   hit->normal[0]=nx/nl; hit->normal[1]=ny/nl; hit->normal[2]=nz/nl; }
                 else { hit->normal[0]=0; hit->normal[1]=0; hit->normal[2]=1; }
@@ -1701,12 +1703,13 @@ int world_ride_gather(const N2Scene *scene,const float pos[3],float heading,
            fabsf(centre.normal[2])>1e-6f) {
             float p=-(centre.normal[0]*co+centre.normal[1]*sn)/centre.normal[2];
             float r=(centre.normal[0]*sn-centre.normal[1]*co)/centre.normal[2];
-            if(fabsf(p)<=PHYS_RIDE_MAXTILT && fabsf(r)<=PHYS_RIDE_MAXTILT) {
+            if(centre.normal[2]>=.30f) {
                 seed_z=centre.z;pitch=p;roll=r;
             }
         }
     }
     int count=0;
+    support->pitch_limit=support->roll_limit=0;
     for(int k=0;k<4;k++) {
         float ax=support->ax[k],ay=support->ay[k];
         float wz=ride?phys_ride_wheel_z(ride,support,k):seed_z+ax*pitch+ay*roll;
@@ -1718,6 +1721,12 @@ int world_ride_gather(const N2Scene *scene,const float pos[3],float heading,
         support->z[k]=support->valid[k]?h->z:wz;
         support->vz[k]=support->valid[k]?phys_ride_support_vz(h->normal,vel,
             old_heading,heading,ax,ay,1.0f/60.0f):0;
+        if(support->valid[k] && h->normal[2]>=.30f) {
+            float p=fabsf((h->normal[0]*co+h->normal[1]*sn)/h->normal[2]);
+            float r=fabsf((-h->normal[0]*sn+h->normal[1]*co)/h->normal[2]);
+            support->pitch_limit=fmaxf(support->pitch_limit,p);
+            support->roll_limit=fmaxf(support->roll_limit,r);
+        }
         count+=support->valid[k];
     }
     return count;
@@ -2080,8 +2089,11 @@ int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
     int cell=cy*g_grid.gw+cx,pushed=0;
     for(int k=g_grid.start[cell];k<g_grid.start[cell+1];k++) {
         int mi=g_grid.list[k];PhysWallContact c;
+        /* Terrain also contains tall retaining walls. The narrow phase clips
+           to actual body height and rejects thin sloping curbs; the legacy
+           rail census's height ceiling must not remove these solid faces. */
         if(!collide_body_mesh_wall(pos,vel,heading,bb,z0,z1,s,mi,
-                                   WALL_RAIL_MIN_H,WALL_RAIL_MAX_H,&c))continue;
+                                   WALL_RAIL_MIN_H,INFINITY,&c))continue;
         if(hit&&!pushed) {
             const N2Mesh *m=&s->meshes[mi];int q=c.tri*3;
             const float *a=m->verts+m->idx[q]*5,*b=m->verts+m->idx[q+1]*5,
@@ -2100,6 +2112,6 @@ int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
 }
 
 int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r) {
-    float probe[3] = {x,y,z};
-    return !world_wall_push(s,probe,r,NULL);
+    float probe[3]={x,y,z},vel[2]={0},bb[6]={-r,-r,0,r,r,1};
+    return !world_body_wall_push(s,probe,vel,0,bb,z-.5f,z+.5f,NULL);
 }

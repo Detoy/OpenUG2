@@ -114,9 +114,9 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
         float smax = (light->r_in > 1.0f ? light->r_in : 10.0f) * 0.35f * halo;
         if (s > smax) s = smax;
         if (s < 0.45f) s = 0.45f;
-        /* Lift it off its own fixture so the lamp geometry cannot clip it,
-           while the depth test still hides lights behind buildings. */
-        float ox = -ld[0]*s*0.9f, oy = -ld[1]*s*0.9f, oz = -ld[2]*s*0.9f;
+        /* Keep the halo at its authored fixture. Scaling this depth bias with
+           sprite size pulled distant lights metres through nearby buildings. */
+        float ox = -ld[0]*0.02f, oy = -ld[1]*0.02f, oz = -ld[2]*0.02f;
         /* Fade over the last quarter of the view range instead of popping. */
         float fade = (viewdist - d) / (viewdist * 0.25f);
         if (fade > 1.0f) fade = 1.0f; else if (fade < 0.0f) fade = 0.0f;
@@ -153,6 +153,437 @@ int render_district_lights(const RProg *r, GpuMesh *quad, GLuint texture,
     return draws;
 }
 
+void render_wet_lights(const RProg *r,const N2LightSrc *lights,int count,
+                       const float cam[3],float gain,int quality) {
+    float pos[8][4]={{0}},color[8][4]={{0}},dist[8];
+    for(int i=0;i<8;i++)dist[i]=3600;
+    int cap=quality<=0?0:quality==1?4:8;
+    for(int i=0;cap>0 && gain>0 && i<count;i++) {
+        const N2LightSrc *l=&lights[i];
+        if(!(l->rgba>>24))continue;
+        float d=0;for(int a=0;a<3;a++){float v=l->pos[a]-cam[a];d+=v*v;}
+        int k=0;while(k<cap && d>=dist[k])k++;
+        if(k==cap)continue;
+        for(int j=cap-1;j>k;j--){dist[j]=dist[j-1];memcpy(pos[j],pos[j-1],sizeof pos[j]);memcpy(color[j],color[j-1],sizeof color[j]);}
+        dist[k]=d;
+        memcpy(pos[k],l->pos,3*sizeof(float));pos[k][3]=fminf(l->r_out,60);
+        for(int a=0;a<3;a++)color[k][a]=((l->rgba>>(8*a))&255)/255.0f;
+        color[k][3]=(l->rgba>>24)/255.0f*gain*fminf(1,(60-sqrtf(d))/10);
+    }
+    glUniform4fv(r->uWetLightPos,8,&pos[0][0]);
+    glUniform4fv(r->uWetLightColor,8,&color[0][0]);
+}
+
+void free_road_reflections(RoadReflections *s) {
+    if(!s)return;
+    glDeleteTextures(1,&s->color);glDeleteTextures(1,&s->depth);
+    memset(s,0,sizeof *s);
+}
+
+static int road_reflection_receiver(const N2Batch *b,const float cam[3]) {
+    if(!b->wettable || b->unresolved || b->drawmode>N2_DRAW_CUTOUT)return 0;
+    float d=0;
+    for(int a=0;a<3;a++) {
+        float v=fmaxf(b->bbox_min[a]-cam[a],fmaxf(0,cam[a]-b->bbox_max[a]));d+=v*v;
+    }
+    return d<80*80;
+}
+
+int render_road_reflections(const RProg *r,RoadReflections *s,
+                           const N2Batch *batches,int count,const float cam[3],
+                           const float mvp[16],const float projection[16],
+                           float wetness,int quality) {
+    if(wetness<=0 || quality<=0 || count<=0)return 0;
+    if(s->failed)return -1;
+#ifdef N2_GLES
+    /* ES2 does not guarantee depth-buffer copies; keep the wet sky/lamp
+       fallback. Add an offscreen depth-texture target for a GLES backend. */
+    s->failed=1;return -1;
+#else
+    int nearby=0;
+    for(int i=0;i<count;i++)nearby+=road_reflection_receiver(&batches[i],cam);
+    if(!nearby)return 0;
+    GLint viewport[4],active,bindings[3];
+    glGetIntegerv(GL_VIEWPORT,viewport);glGetIntegerv(GL_ACTIVE_TEXTURE,&active);
+    if(viewport[2]<=0 || viewport[3]<=0)return 0;
+    const GLenum units[]={GL_TEXTURE0,GL_TEXTURE3,GL_TEXTURE4};
+    for(int i=0;i<3;i++){glActiveTexture(units[i]);glGetIntegerv(GL_TEXTURE_BINDING_2D,&bindings[i]);}
+    GLuint *textures[]={&s->color,&s->depth};
+    int resize=s->width!=viewport[2] || s->height!=viewport[3];
+    for(int i=0;i<2;i++) {
+        glActiveTexture(units[i+1]);
+        if(!*textures[i])glGenTextures(1,textures[i]);
+        glBindTexture(GL_TEXTURE_2D,*textures[i]);
+        if(resize) {
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,i?GL_NEAREST:GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,i?GL_NEAREST:GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+            glCopyTexImage2D(GL_TEXTURE_2D,0,i?GL_DEPTH_COMPONENT:GL_RGBA,
+                             viewport[0],viewport[1],viewport[2],viewport[3],0);
+        } else glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,viewport[0],viewport[1],viewport[2],viewport[3]);
+    }
+    if(glGetError()!=GL_NO_ERROR) {
+        free_road_reflections(s);s->failed=1;
+        for(int i=0;i<3;i++){glActiveTexture(units[i]);glBindTexture(GL_TEXTURE_2D,bindings[i]);}
+        glActiveTexture(active);return -1;
+    }
+    s->width=viewport[2];s->height=viewport[3];
+    const GLint loc[]={r->uUnlit,r->uVista,r->uEmissiveTex,r->uUVCheck,r->uFlipN,
+        r->uFresnel,r->uAlphaTest,r->uWetness,r->uRoadReflection};
+    float saved[9],matrix[16],model[16],params[4];
+    for(int i=0;i<9;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+    glGetUniformfv(r->prog,r->uMVP,matrix);glGetUniformfv(r->prog,r->uModel,model);
+    glGetUniformfv(r->prog,r->uReflectionParams,params);
+    GLint df,sr,dr,sa,da;GLboolean mask;
+    GLboolean depth=glIsEnabled(GL_DEPTH_TEST),blend=glIsEnabled(GL_BLEND),cull=glIsEnabled(GL_CULL_FACE);
+    GLboolean offset=glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    glGetIntegerv(GL_DEPTH_FUNC,&df);glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&sr);glGetIntegerv(GL_BLEND_DST_RGB,&dr);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&sa);glGetIntegerv(GL_BLEND_DST_ALPHA,&da);
+    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_EQUAL);glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);glDisable(GL_POLYGON_OFFSET_FILL);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    for(int i=0;i<7;i++)glUniform1f(loc[i],0);
+    glUniform1f(r->uWetness,wetness);glUniform1f(r->uRoadReflection,1);
+    glUniform4f(r->uReflectionParams,projection[10],projection[14],quality==1?16:32,0);
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,mvp);render_model(r,NULL);
+    glActiveTexture(GL_TEXTURE0);
+    int draws=0;
+    for(int i=0;i<count;i++) {
+        const N2Batch *b=&batches[i];if(!road_reflection_receiver(b,cam))continue;
+        glBindTexture(GL_TEXTURE_2D,b->tex);
+        glUniform1f(r->uAlphaTest,b->drawmode==N2_DRAW_CUTOUT?1:0);
+        draw_batch(b);draws++;
+    }
+    for(int i=0;i<9;i++)glUniform1f(loc[i],saved[i]);
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,matrix);glUniformMatrix4fv(r->uModel,1,GL_FALSE,model);
+    glUniform4fv(r->uReflectionParams,1,params);
+    glDepthFunc(df);glDepthMask(mask);if(!depth)glDisable(GL_DEPTH_TEST);
+    if(!blend)glDisable(GL_BLEND);if(cull)glEnable(GL_CULL_FACE);if(offset)glEnable(GL_POLYGON_OFFSET_FILL);
+    glBlendFuncSeparate(sr,dr,sa,da);
+    for(int i=0;i<3;i++){glActiveTexture(units[i]);glBindTexture(GL_TEXTURE_2D,bindings[i]);}
+    glActiveTexture(active);
+    return draws;
+#endif
+}
+
+void render_free_camera(float eye[3],float yaw,float pitch,const float move[3],float speed,float look[3]) {
+    look[0]=cosf(yaw)*cosf(pitch);look[1]=sinf(yaw)*cosf(pitch);look[2]=sinf(pitch);
+    float delta[3]={look[0]*move[0]+sinf(yaw)*move[1],
+                    look[1]*move[0]-cosf(yaw)*move[1],look[2]*move[0]+move[2]};
+    float length=sqrtf(delta[0]*delta[0]+delta[1]*delta[1]+delta[2]*delta[2]);
+    if(!isfinite(length) || !isfinite(speed))return;
+    float step=fmaxf(0,speed)/fmaxf(1,length);
+    for(int a=0;a<3;a++)eye[a]+=step*delta[a];
+}
+
+/* Affine projection along the same key-light direction as the lit materials.
+ * ponytail: one receiving ground plane per car; a terrain shadow map is needed
+ * if silhouettes must wrap stairs or nearby walls instead of the road plane. */
+void mat_ground_shadow(const float ground[3],const float normal[3],float m[16]) {
+    float light[3]={N2_SUN_X,N2_SUN_Y,N2_SUN_Z};
+    float d=0,plane=.025f;
+    for(int a=0;a<3;a++){d+=normal[a]*light[a];plane+=normal[a]*ground[a];}
+    if(d<.15f){for(int a=0;a<3;a++)light[a]=normal[a];d=1;}
+    memset(m,0,16*sizeof *m);m[15]=1;
+    for(int a=0;a<3;a++) {
+        for(int b=0;b<3;b++)m[b*4+a]=(a==b?1:0)-light[a]*normal[b]/d;
+        m[12+a]=light[a]*plane/d;
+    }
+}
+
+void free_car_shadow(CarShadow *s) {
+    if(s->body)glDeleteBuffers(1,&s->body);
+    if(s->wheel)glDeleteBuffers(1,&s->wheel);
+    memset(s,0,sizeof *s);
+}
+
+/* Flatten indices once per loaded model, not once per frame/traffic actor.
+ * Position-only casters merge material slices into one draw per rigid part. */
+static int shadow_vertices(const N2Scene *car,int stock,const N2Scene *rims,
+                           int wheel,GLuint *buffer,int *vertices) {
+    const N2Scene *source=wheel && rims && rims->count?rims:car;
+    size_t count=0;
+    for(int i=0;i<source->count;i++) {
+        const N2Mesh *m=source->meshes+i;
+        if(wheel) {
+            if(source==car && (stock<0 || m->car_mount!=N2_MOUNT_WHEEL ||
+               m->tierid!=car->meshes[stock].tierid))continue;
+        }else if(m->car_mount!=N2_MOUNT_BODY)continue;
+        count+=(size_t)m->nidx;
+    }
+    if(!count){*vertices=0;return 1;}
+    if(count>INT_MAX || count>SIZE_MAX/(3*sizeof(float)))return 0;
+    float *positions=malloc(count*3*sizeof *positions);if(!positions)return 0;
+    size_t n=0;
+    for(int i=0;i<source->count;i++) {
+        const N2Mesh *m=source->meshes+i;
+        if(wheel) {
+            if(source==car && (stock<0 || m->car_mount!=N2_MOUNT_WHEEL ||
+               m->tierid!=car->meshes[stock].tierid))continue;
+        }else if(m->car_mount!=N2_MOUNT_BODY)continue;
+        for(int j=0;j+2<m->nidx;j+=3) {
+            if(m->idx[j]>=m->nverts || m->idx[j+1]>=m->nverts || m->idx[j+2]>=m->nverts)continue;
+            for(int k=0;k<3;k++){memcpy(positions+n*3,m->verts+m->idx[j+k]*5,3*sizeof(float));n++;}
+        }
+    }
+    glGenBuffers(1,buffer);glBindBuffer(GL_ARRAY_BUFFER,*buffer);
+    glBufferData(GL_ARRAY_BUFFER,n*3*sizeof *positions,positions,GL_STATIC_DRAW);
+    free(positions);*vertices=(int)n;return 1;
+}
+
+int render_car_shadow(const RProg *r,CarShadow *s,const N2Scene *car,const GpuMesh *gpu,
+                      int stock,const N2Scene *rims,const GpuMesh *rim_gpu,
+                      const float model[16],const float wheels[4][16],const float mvp[16],
+                      const float ground[3],const float normal[3],int quality) {
+    if(!car || !car->count || !gpu || quality<=0)return 0;
+    GLuint body_key=gpu[0].vbo,wheel_key=rims && rims->count && rim_gpu?rim_gpu[0].vbo:
+                                    stock>=0?gpu[stock].vbo:0;
+    if(s->body_key!=body_key || s->wheel_key!=wheel_key) {
+        free_car_shadow(s);
+        if(!shadow_vertices(car,stock,rims,0,&s->body,&s->body_count) ||
+           !shadow_vertices(car,stock,rims,1,&s->wheel,&s->wheel_count)) {
+            free_car_shadow(s);return -1;
+        }
+        s->body_key=body_key;s->wheel_key=wheel_key;
+    }
+    float projection[16],projected[16];mat_ground_shadow(ground,normal,projection);
+    mat_mul(mvp,projection,projected);
+    int draws=0;
+    GLboolean cull=glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);glEnable(GL_STENCIL_TEST);glStencilMask(0xff);
+    glStencilFunc(GL_EQUAL,0,0xff);glStencilOp(GL_KEEP,GL_KEEP,GL_INCR);
+    glUniform1f(r->uUnlit,1);glUniform1f(r->uSoft,0);glUniform1f(r->uUseTex,0);
+    glUniform3f(r->uColor,0,0,0);glUniform1f(r->uAlpha,.48f);
+    glEnableVertexAttribArray(0);
+    for(int a=1;a<4;a++)glDisableVertexAttribArray(a);
+    /* Body and wheel coverage share the stencil reference for this actor. */
+    for(int part=0;part<5;part++) {
+        GLuint buffer=part?s->wheel:s->body;int n=part?s->wheel_count:s->body_count;
+        if(!buffer || !n)continue;
+        float matrix[16];mat_mul(projected,part?wheels[part-1]:model,matrix);
+        glUniformMatrix4fv(r->uMVP,1,GL_FALSE,matrix);
+        glBindBuffer(GL_ARRAY_BUFFER,buffer);glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,0);
+        glDrawArrays(GL_TRIANGLES,0,n);draws++;
+    }
+    glDisable(GL_STENCIL_TEST);glDepthMask(GL_TRUE);glDisable(GL_BLEND);
+    glUniform1f(r->uUnlit,0);glUniform1f(r->uAlpha,1);
+    if(cull)glEnable(GL_CULL_FACE);
+    return draws;
+}
+
+void free_car_environment(CarEnvironment *s) {
+    if(s->fbo)glDeleteFramebuffers(1,&s->fbo);
+    if(s->depth)glDeleteRenderbuffers(1,&s->depth);
+    glDeleteTextures(2,s->cube);
+    if(s->capture.prog)glDeleteProgram(s->capture.prog);
+    memset(s,0,sizeof *s);
+}
+
+int render_car_environment(const RProg *r,CarEnvironment *s,const N2Batch *world,int count,
+                           const N2Batch *sky,int nsky,const float pos[3],int quality) {
+    glUniform1f(r->uEnvReady,0);
+    if(quality<=0 || count<=0 || s->failed)return 0;
+    if(quality==1 && s->size==64 && s->ready && (++s->ticks&1)) {
+        glUniform1f(r->uEnvReady,1);glUniform3fv(r->uEnvOrigin,1,s->published);return 0;
+    }
+    GLint program,fbo,rb,viewport[4],active,texture,depthfunc,sr,dr,sa,da;
+    GLfloat clear[4];GLboolean depthmask,color_mask[4];
+    GLboolean depth=glIsEnabled(GL_DEPTH_TEST),blend=glIsEnabled(GL_BLEND),cull=glIsEnabled(GL_CULL_FACE);
+    GLboolean scissor=glIsEnabled(GL_SCISSOR_TEST),stencil=glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_CURRENT_PROGRAM,&program);glGetIntegerv(GL_FRAMEBUFFER_BINDING,&fbo);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING,&rb);glGetIntegerv(GL_VIEWPORT,viewport);
+    glGetIntegerv(GL_ACTIVE_TEXTURE,&active);glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);glGetIntegerv(GL_DEPTH_FUNC,&depthfunc);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE,clear);glGetBooleanv(GL_DEPTH_WRITEMASK,&depthmask);
+    glGetBooleanv(GL_COLOR_WRITEMASK,color_mask);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&sr);glGetIntegerv(GL_BLEND_DST_RGB,&dr);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&sa);glGetIntegerv(GL_BLEND_DST_ALPHA,&da);
+    int size=quality==1?64:128,draws=0;
+    if(s->size!=size) {
+        free_car_environment(s);s->size=size;s->capture=render_program();
+        GLint linked=0;glGetProgramiv(s->capture.prog,GL_LINK_STATUS,&linked);
+        if(!linked){free_car_environment(s);s->failed=1;draws=-1;goto restore;}
+        glGenTextures(2,s->cube);glActiveTexture(GL_TEXTURE5);
+        for(int t=0;t<2;t++) {
+            glBindTexture(GL_TEXTURE_CUBE_MAP,s->cube[t]);
+            for(int face=0;face<6;face++)glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X+face,0,
+                GL_RGBA,size,size,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+        }
+        glGenFramebuffers(1,&s->fbo);glGenRenderbuffers(1,&s->depth);
+        glBindRenderbuffer(GL_RENDERBUFFER,s->depth);
+        glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,size,size);
+    }
+    if(s->face==0)memcpy(s->origin,pos,sizeof s->origin);
+    glBindFramebuffer(GL_FRAMEBUFFER,s->fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,s->depth);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_CUBE_MAP_POSITIVE_X+s->face,s->cube[1-s->front],0);
+    if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) {
+        free_car_environment(s);s->failed=1;draws=-1;goto restore;
+    }
+    glViewport(0,0,size,size);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LESS);glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);glDisable(GL_CULL_FACE);glDisable(GL_SCISSOR_TEST);glDisable(GL_STENCIL_TEST);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glUseProgram(s->capture.prog);
+    glActiveTexture(GL_TEXTURE5);glBindTexture(GL_TEXTURE_CUBE_MAP,s->cube[s->front]);
+    glActiveTexture(GL_TEXTURE0);
+    const RProg *cr=&s->capture;float ambient,diffuse,fog,fc[3],sun[3];
+    glGetUniformfv(r->prog,r->uAmbient,&ambient);glGetUniformfv(r->prog,r->uDiffuse,&diffuse);
+    glGetUniformfv(r->prog,r->uFogDensity,&fog);glGetUniformfv(r->prog,r->uFogColor,fc);
+    glGetUniformfv(r->prog,r->uLight,sun);
+    glUniform1f(cr->uAmbient,ambient);glUniform1f(cr->uDiffuse,diffuse);
+    glUniform3fv(cr->uFogColor,1,fc);glUniform3fv(cr->uLight,1,sun);
+    glUniform3fv(cr->uCamPos,1,s->origin);glUniform1f(cr->uVColor,1);render_model(cr,NULL);
+    static const float directions[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+    static const float ups[6][3]={{0,-1,0},{0,-1,0},{0,0,1},{0,0,-1},{0,-1,0},{0,-1,0}};
+    const float *f=directions[s->face],*up=ups[s->face];
+    float right[3]={f[1]*up[2]-f[2]*up[1],f[2]*up[0]-f[0]*up[2],f[0]*up[1]-f[1]*up[0]};
+    float vertical[3]={right[1]*f[2]-right[2]*f[1],right[2]*f[0]-right[0]*f[2],right[0]*f[1]-right[1]*f[0]};
+    float view[16]={0},p[16],matrix[16];view[15]=1;
+    for(int a=0;a<3;a++) {
+        view[a*4]=right[a];view[a*4+1]=vertical[a];view[a*4+2]=-f[a];
+        view[12]-=right[a]*s->origin[a];view[13]-=vertical[a]*s->origin[a];view[14]+=f[a]*s->origin[a];
+    }
+    mat_persp(1.570796327f,1,.15f,30000,p);mat_mul(p,view,matrix);
+    glUniformMatrix4fv(cr->uMVP,1,GL_FALSE,matrix);
+    glUniform1f(cr->uEmissiveTex,1);glUniform1f(cr->uFogDensity,0);glDepthMask(GL_FALSE);
+    for(int i=0;i<nsky;i++)if(sky[i].tex) {
+        glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        glUniform1f(cr->uUseTex,1);glBindTexture(GL_TEXTURE_2D,sky[i].tex);draw_batch(sky+i);draws++;
+    }
+    glDepthMask(GL_TRUE);glDisable(GL_BLEND);glUniform1f(cr->uEmissiveTex,0);
+    glUniform1f(cr->uFogDensity,fog);
+    mat_persp(1.570796327f,1,.15f,350,p);mat_mul(p,view,matrix);
+    glUniformMatrix4fv(cr->uMVP,1,GL_FALSE,matrix);
+    for(int i=0;i<count;i++) {
+        const N2Batch *b=world+i;
+        if(b->unresolved || b->drawmode==N2_DRAW_BLEND || !render_batch_in_view(b,matrix))continue;
+        glUniform1f(cr->uUseTex,b->tex?1:0);glUniform3f(cr->uColor,.28f,.29f,.31f);
+        glUniform1f(cr->uAlphaTest,b->drawmode==N2_DRAW_CUTOUT?1:0);
+        glUniform1f(cr->uTextureAlpha,b->drawmode==N2_DRAW_ADD?1:0);
+        if(b->drawmode==N2_DRAW_ADD){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE);glDepthMask(GL_FALSE);}
+        else {glDisable(GL_BLEND);glDepthMask(GL_TRUE);}
+        glBindTexture(GL_TEXTURE_2D,b->tex);draw_batch(b);draws++;
+    }
+    if(++s->face==6){s->face=0;s->front=1-s->front;s->ready=1;memcpy(s->published,s->origin,sizeof s->published);}
+restore:
+    glBindFramebuffer(GL_FRAMEBUFFER,fbo);glBindRenderbuffer(GL_RENDERBUFFER,rb);
+    glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);glUseProgram(program);
+    glClearColor(clear[0],clear[1],clear[2],clear[3]);glColorMask(color_mask[0],color_mask[1],color_mask[2],color_mask[3]);
+    glDepthFunc(depthfunc);glDepthMask(depthmask);glBlendFuncSeparate(sr,dr,sa,da);
+    if(depth)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);
+    if(blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);
+    if(cull)glEnable(GL_CULL_FACE);else glDisable(GL_CULL_FACE);
+    if(scissor)glEnable(GL_SCISSOR_TEST);else glDisable(GL_SCISSOR_TEST);
+    if(stencil)glEnable(GL_STENCIL_TEST);else glDisable(GL_STENCIL_TEST);
+    glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,texture);
+    glActiveTexture(GL_TEXTURE5);glBindTexture(GL_TEXTURE_CUBE_MAP,s->cube[s->front]);
+    glActiveTexture(active);
+    glUniform1f(r->uEnvReady,s->ready?1:0);glUniform3fv(r->uEnvOrigin,1,s->published);
+    return draws;
+}
+
+/* Stateless lens droplets: no gameplay RNG, simulation steps or per-drop draws. */
+static uint32_t rain_hash(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15;
+    x *= 0x846ca68bu; return x ^ (x >> 16);
+}
+static float rain_unit(uint32_t x) { return (rain_hash(x) & 0xffffffu)/16777216.0f; }
+
+/* One camera cover query, sampled by the caller at 4 Hz. No per-drop world scan. */
+int render_rain_exposed(const N2Scene *scene,const float (*bounds)[4],const float cam[3]) {
+    for(int mi=0;scene && mi<scene->count;mi++) {
+        const N2Mesh *m=&scene->meshes[mi];
+        if(m->cat==N2_SKY || m->cat==N2_GLOW)continue;
+        if(bounds && (cam[0]<bounds[mi][0] || cam[0]>bounds[mi][2] ||
+                      cam[1]<bounds[mi][1] || cam[1]>bounds[mi][3]))continue;
+        for(int t=0;t+2<m->nidx;t+=3) {
+            const float *a=m->verts+5*m->idx[t],*b=m->verts+5*m->idx[t+1],*c=m->verts+5*m->idx[t+2];
+            if(fmaxf(a[2],fmaxf(b[2],c[2]))<=cam[2]+.1f)continue;
+            float d=(b[1]-c[1])*(a[0]-c[0])+(c[0]-b[0])*(a[1]-c[1]);
+            if(fabsf(d)<1e-7f)continue;
+            float u=((b[1]-c[1])*(cam[0]-c[0])+(c[0]-b[0])*(cam[1]-c[1]))/d;
+            float v=((c[1]-a[1])*(cam[0]-c[0])+(a[0]-c[0])*(cam[1]-c[1]))/d;
+            if(u>=0 && v>=0 && u+v<=1 && u*a[2]+v*b[2]+(1-u-v)*c[2]>cam[2]+.1f)return 0;
+        }
+    }
+    return 1;
+}
+
+int render_rain_vertices(float time,float intensity,int quality,float aspect,RainVertex *out) {
+    if(!out || !isfinite(time) || time<0 || !isfinite(intensity) || intensity<=0 ||
+       !isfinite(aspect) || aspect<=0)return 0;
+    if(intensity>1)intensity=1;
+    if(quality<0)quality=0; if(quality>2)quality=2;
+    int n=0,count=12<<quality;
+    static const unsigned char corner[6][2]={{0,0},{1,0},{1,1},{0,0},{1,1},{0,1}};
+    for(int i=0;i<count;i++) {
+        uint32_t seed=rain_hash((uint32_t)i+71);
+        if(rain_unit(seed+1)>intensity)continue;
+        float life=3+rain_unit(seed+2)*4,phase=time/life+rain_unit(seed+3);
+        float age=phase-floorf(phase);
+        seed=rain_hash(seed+(uint32_t)floorf(phase));
+        float cx=rain_unit(seed+4)*1.9f-.95f;
+        float cy=rain_unit(seed+5)*1.9f-.8f-age*age*.28f;
+        float h=.022f+rain_unit(seed+6)*.04f,w=h/(aspect*(1+age*.8f));
+        float fade=fminf(1,age*10)*fminf(1,(1-age)*5);
+        for(int q=0;q<6;q++) {
+            RainVertex *o=&out[n++];float u=corner[q][0],v=corner[q][1];
+            o->pos[0]=cx+(u-.5f)*w;o->pos[1]=cy+(v-.5f)*h;o->pos[2]=0;
+            o->uv[0]=u;o->uv[1]=v;o->fade=fade;
+        }
+    }
+    return n;
+}
+
+int render_rain(const RProg *r,GLuint *vbo,float time,float intensity,int quality,float aspect) {
+    if(intensity<=0)return 0;
+    RainVertex vertices[RAIN_MAX_DROPS*6];
+    int n=render_rain_vertices(time,intensity,quality,aspect,vertices);
+    if(!n)return 0;
+    if(!*vbo)glGenBuffers(1,vbo);
+    if(!*vbo)return 0;
+    const GLint loc[]={r->uUnlit,r->uEmissiveTex,r->uUseTex,r->uSoft,r->uAlpha,r->uVista,r->uUVCheck};
+    float saved[7],matrix[16];
+    for(int i=0;i<7;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+    glGetUniformfv(r->prog,r->uMVP,matrix);
+    GLboolean depth=glIsEnabled(GL_DEPTH_TEST),blend=glIsEnabled(GL_BLEND),cull=glIsEnabled(GL_CULL_FACE),mask;
+    GLint sr,dr,sa,da;
+    glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
+    glGetIntegerv(GL_BLEND_SRC_RGB,&sr);glGetIntegerv(GL_BLEND_DST_RGB,&dr);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA,&sa);glGetIntegerv(GL_BLEND_DST_ALPHA,&da);
+    glDisable(GL_DEPTH_TEST);glDepthMask(GL_FALSE);glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1f(r->uUnlit,1);glUniform1f(r->uEmissiveTex,0);glUniform1f(r->uUseTex,0);
+    glUniform1f(r->uVista,0);glUniform1f(r->uUVCheck,0);
+    glUniform1f(r->uSoft,3);glUniform1f(r->uAlpha,.8f*fminf(intensity,1));
+    const float identity[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,identity);
+    glBindBuffer(GL_ARRAY_BUFFER,*vbo);
+    glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)(n*sizeof *vertices),vertices,GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,sizeof(RainVertex),(void*)0);
+    glEnableVertexAttribArray(1);glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,sizeof(RainVertex),(void*)12);
+    glEnableVertexAttribArray(3);glVertexAttribPointer(3,1,GL_FLOAT,GL_FALSE,sizeof(RainVertex),(void*)20);
+    /* No normal input is consumed by the unlit rain branch. Disable it so a
+       preceding small mesh buffer cannot be indexed beyond its allocation. */
+    glDisableVertexAttribArray(2);glVertexAttrib3f(2,0,0,1);
+    glDrawArrays(GL_TRIANGLES,0,n);
+    for(int i=0;i<7;i++)glUniform1f(loc[i],saved[i]);
+    glUniformMatrix4fv(r->uMVP,1,GL_FALSE,matrix);
+    glDepthMask(mask);if(depth)glEnable(GL_DEPTH_TEST);
+    if(!blend)glDisable(GL_BLEND);if(cull)glEnable(GL_CULL_FACE);
+    glBlendFuncSeparate(sr,dr,sa,da);
+    return 1;
+}
+
 static const char *VS =
     GLSL_HEADER
     "attribute vec3 aPos; attribute vec2 aUV; attribute vec3 aNor; attribute vec4 aColor;\n"
@@ -175,7 +606,13 @@ static const char *FS =
     "uniform float uAmbient; uniform float uDiffuse; uniform vec3 uLight;\n"
     "uniform vec3 uFogColor; uniform float uFogDensity;\n"
     "uniform vec3 uCamPos; uniform float uEnv; uniform float uUVCheck;\n"
+    "uniform samplerCube uEnvCube; uniform float uEnvReady; uniform vec3 uEnvOrigin;\n"
     "uniform float uGloss; uniform float uFlipN;\n"
+    "uniform float uWetness, uWeatherTime, uRainIntensity;\n"
+    "uniform vec4 uWetLightPos[8],uWetLightColor[8];\n"
+    "uniform float uPaintLights;\n"
+    "uniform float uRoadReflection; uniform vec4 uReflectionParams;\n"
+    "uniform sampler2D uReflectionColor,uReflectionDepth; uniform mat4 uMVP;\n"
     "uniform float uRimTint;\n"   /* >0: recolor the rim diffuse toward uColor */
     "uniform vec3 uEmissive;\n"   /* lamp emission added on top of the lit result */
     "uniform float uVista;\n"     /* >0.5: authored backdrop pass, alpha-blended */
@@ -209,6 +646,49 @@ static const char *FS =
     "    visibility+=step(depth,dot(depthRG,vec2(1.0,1.0/255.0)))*0.25;\n"
     "  }\n"
     "  return visibility;\n"
+    "}\n"
+    "float wetHash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}\n"
+    "float wetNoise(vec2 p){\n"
+    "  vec2 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);\n"
+    "  return mix(mix(wetHash(i),wetHash(i+vec2(1,0)),f.x),mix(wetHash(i+vec2(0,1)),wetHash(i+vec2(1,1)),f.x),f.y);\n"
+    "}\n"
+    /* Screen-space reflection: bounded trace against this frame's depth.
+       Missing/offscreen geometry keeps the ordinary wet material underneath. */
+    "vec4 roadReflection(vec3 N,vec3 V,float wet,float puddle){\n"
+    "  if(wet<0.001 || distance(vPos,uCamPos)>80.0)return vec4(0.0);\n"
+    "  vec3 direction=reflect(-V,N),origin=vPos+N*0.04;\n"
+    "  float previous=0.0;\n"
+    "  for(int i=0;i<32;i++){\n"
+    "    if(float(i)>=uReflectionParams.z)break;\n"
+    "    float stepSize=32.0/uReflectionParams.z;\n"
+    "    float t=0.3+pow((float(i)+1.0)*stepSize,2.0)*0.045;\n"
+    "    vec4 clip=uMVP*vec4(origin+direction*t,1.0);\n"
+    "    vec2 uv=clip.xy/clip.w*0.5+0.5;\n"
+    "    if(clip.w<=0.1 || min(uv.x,uv.y)<0.002 || max(uv.x,uv.y)>0.998)break;\n"
+    "    float depth=texture2D(uReflectionDepth,uv).r;\n"
+    "    float surface=uReflectionParams.y/(depth*2.0-1.0+uReflectionParams.x);\n"
+    "    if(depth<0.999999 && clip.w>surface){\n"
+    "      float lo=previous,hi=t;\n"
+    "      for(int j=0;j<5;j++){\n"
+    "        float mid=(lo+hi)*0.5;\n"
+    "        clip=uMVP*vec4(origin+direction*mid,1.0); uv=clip.xy/clip.w*0.5+0.5;\n"
+    "        depth=texture2D(uReflectionDepth,uv).r;\n"
+    "        surface=uReflectionParams.y/(depth*2.0-1.0+uReflectionParams.x);\n"
+    "        if(clip.w>surface)hi=mid;else lo=mid;\n"
+    "      }\n"
+    "      clip=uMVP*vec4(origin+direction*hi,1.0); uv=clip.xy/clip.w*0.5+0.5;\n"
+    "      depth=texture2D(uReflectionDepth,uv).r;\n"
+    "      surface=uReflectionParams.y/(depth*2.0-1.0+uReflectionParams.x);\n"
+    "      float gap=clip.w-surface;\n"
+    "      if(hi<0.6 || depth>=0.999999 || gap<0.0 || gap>0.4+surface*0.003)return vec4(0.0);\n"
+    "      float edge=smoothstep(0.0,0.08,min(min(uv.x,uv.y),min(1.0-uv.x,1.0-uv.y)));\n"
+    "      float fres=0.04+0.96*pow(1.0-max(dot(N,V),0.0),3.0);\n"
+    "      float fade=(1.0-smoothstep(30.0,46.0,hi))*(1.0-smoothstep(60.0,80.0,distance(vPos,uCamPos)));\n"
+    "      return vec4(texture2D(uReflectionColor,uv).rgb,edge*fade*fres*(0.18*wet+0.72*puddle));\n"
+    "    }\n"
+    "    previous=t;\n"
+    "  }\n"
+    "  return vec4(0.0);\n"
     "}\n"
     /* exp^2 distance fog: fades far batches into the sky colour (which is
        cleared to uFogColor, so the horizon and the haze always agree) */
@@ -250,7 +730,17 @@ static const char *FS =
     /* Shadow footprints need a filled rounded rectangle; lamp/neon sprites
        retain their radial falloff. Both fade to zero at the quad boundary. */
     "    if(uSoft>0.5){\n"
-    "      if(uSoft>1.5){ float d=length(max(abs(vUV-vec2(0.5))-vec2(0.4),vec2(0.0))); a*=1.0-smoothstep(0.02,0.1,d); }\n"
+    /* ponytail: transparent lens highlights, no refraction copy. Add image
+       distortion only if its measured cost fits the frame budget. */
+    "      if(uSoft>2.5){\n"
+    "        vec2 p=vUV*2.0-1.0; p.x*=1.0+0.12*p.y; float d=dot(p,p); if(d>1.0)discard;\n"
+    "        float rim=smoothstep(0.48,0.83,d)*(1.0-smoothstep(0.83,1.0,d));\n"
+    "        float glint=pow(max(0.0,1.0-length(p-vec2(-0.25,0.35))*3.0),3.0);\n"
+    "        float shade=clamp(0.35+p.y*0.65+glint,0.0,1.0);\n"
+    "        vec3 drop=mix(vec3(0.015,0.025,0.035),vec3(0.85,0.92,1.0),shade);\n"
+    "        gl_FragColor=vec4(drop,vColor.r*uAlpha*(0.04*(1.0-d)+0.26*rim+0.28*glint));return;\n"
+    "      }\n"
+    "      else if(uSoft>1.5){ float d=length(max(abs(vUV-vec2(0.5))-vec2(0.4),vec2(0.0))); a*=1.0-smoothstep(0.02,0.1,d); }\n"
     "      else { float d=length(vUV-vec2(0.5)); a*=clamp(1.0-d*2.0,0.0,1.0); } a*=a; }\n"
     "    gl_FragColor=vec4(mix(uFogColor,uColor,fog),a); return; }\n"
     /* Positions, normals, light and camera share world space. The model
@@ -261,6 +751,24 @@ static const char *FS =
     /* Two-sided glass reflects the viewer-facing side; a backwards normal
        otherwise forces Fresnel to 1 and makes the far window fully opaque. */
     "  if(uFresnel>0.5 && dot(N,V)<0.0) N=-N;\n"
+    /* World-anchored patches avoid texture seams and camera-following puddles.
+       ponytail: analytic sky/key-light fallback for offscreen geometry; use
+       environment probes if reflections must survive outside the camera. */
+    "  float wet=uWetness*smoothstep(0.55,0.9,N.z);\n"
+    "  float puddle=0.0;\n"
+    "  if(wet>0.001){\n"
+    "    float pools=0.7*wetNoise(vPos.xy*0.24)+0.3*wetNoise(vPos.xy*0.73);\n"
+    "    puddle=wet*smoothstep(0.4,0.7,pools);\n"
+    "  }\n"
+    "  if(puddle>0.001 && uRainIntensity>0.0){\n"
+    "    vec2 ripple=sin(vPos.xy*16.0+uWeatherTime*vec2(7.0,-9.0));\n"
+    "    N=normalize(N+vec3(ripple*0.018*puddle*uRainIntensity,0.0));\n"
+    "  }\n"
+    "  if(uRoadReflection>0.5){\n"
+    "    if(uAlphaTest>0.5 && texture2D(uTex,vUV).a<0.5)discard;\n"
+    "    vec4 reflected=roadReflection(N,V,wet,puddle); reflected.a*=fog;\n"
+    "    gl_FragColor=reflected;return;\n"
+    "  }\n"
     "  float nl=max(dot(N,L),0.0);\n"
     "  float d=uAmbient+uDiffuse*nl;\n"   /* directional; reveals body form */
     /* uAmbient/uDiffuse are one shared per-frame pair (world+cars both read
@@ -314,11 +822,40 @@ static const char *FS =
        lobe alone is what makes painted metal read as moulded plastic. */
     "  sp += pow(rl, 160.0)*uClearcoat;\n"
     "  float rim = pow(1.0-abs(N.z), 3.0)*uSpec*0.4;\n"        /* fresnel-ish edge sheen */
+    /* The city capture supplies the clear-coat shape; the night key light
+       must not clip the hood to white and hide those reflected buildings. */
+    "  if(uEnvReady>0.5 && uClearcoat>0.001){sp*=0.30;rim*=0.25;}\n"
     "  vec3 lit = base*d*1.35 + sp + rim;\n"
     /* World prelight uses MODULATE2X (0.5 neutral); textureless vehicle assets
        use the same byte slot as direct diffuse color for windows and trim. */
     "  if(uVColor>1.5) lit *= vColor.rgb;\n"
     "  else if(uVColor>0.001) lit *= clamp(vColor.rgb*2.0, 0.0, 1.6);\n"
+    "  if(wet>0.001){\n"
+    "    lit*=1.0-0.32*wet;\n"
+    "    float wf=0.025+0.975*pow(1.0-max(dot(N,V),0.0),5.0);\n"
+    "    vec3 sky=mix(uFogColor,vec3(0.16,0.20,0.28),0.5);\n"
+    "    lit=mix(lit,sky,clamp(wf*(0.3*wet+0.65*puddle),0.0,0.85));\n"
+    "    lit+=vec3(0.65,0.72,0.85)*pow(rl,mix(36.0,120.0,puddle))*wet*0.35;\n"
+    "  }\n"
+    /* ponytail: camera-local unshadowed district highlights. Add per-car light
+       selection for distant cars, light shadows for leakage; headlights use shadows. */
+    "  if(wet>0.001 || uPaintLights*uClearcoat>0.001)for(int i=0;i<8;i++){\n"
+    "    vec3 delta=uWetLightPos[i].xyz-vPos; float distance=length(delta);\n"
+    "    if(uWetLightColor[i].a>0.0 && distance<uWetLightPos[i].w){\n"
+    "      vec3 toLight=delta/max(distance,0.001);\n"
+    "      float reflected=max(dot(reflect(-toLight,N),V),0.0);\n"
+    "      float attenuation=1.0-smoothstep(0.0,uWetLightPos[i].w,distance);\n"
+    "      vec3 radiance=uWetLightColor[i].rgb*uWetLightColor[i].a*attenuation;\n"
+    "      if(wet>0.001 && delta.z>0.0)lit+=radiance*pow(reflected,mix(18.0,85.0,puddle))*wet*(0.3+1.7*puddle);\n"
+    /* Existing clear-coat classification excludes rubber, cabin and plastic.
+       No new scene pass or reflection copy: source lamps, normal and view
+       determine a moving paint highlight in this same material draw. */
+    "      if(uPaintLights*uClearcoat>0.001){\n"
+    "        float glint=0.3*uSpec*pow(reflected,max(uGloss,24.0))+0.65*uClearcoat*pow(reflected,96.0);\n"
+    "        lit+=radiance*glint*uPaintLights*max(dot(N,toLight),0.0);\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
     /* Surface lighting and per-lamp world-geometry shadows. */
     "  if(uHeadGain>0.0) for(int h=0;h<2;h++){\n"
     "    vec3 ray=vPos-uHeadPos[h].xyz; float dist=length(ray);\n"
@@ -332,24 +869,23 @@ static const char *FS =
     "      float reach=1.0-smoothstep(uHeadShape.w*0.65,uHeadShape.w,dist);\n"
     "      float lambert=max(dot(N,-ray/max(dist,0.001)),0.0);\n"
     "      if(edge*cutoff*lambert>0.0)lit+=base*vec3(1.0,0.94,0.82)*edge*cutoff*reach*lambert*uHeadGain*5.0*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);\n"
+    "      if(wet>0.001 && edge*cutoff>0.0){\n"
+    "        float highlight=pow(max(dot(reflect(ray/max(dist,0.001),N),V),0.0),mix(24.0,100.0,puddle));\n"
+    "        lit+=vec3(1.0,0.94,0.82)*highlight*wet*edge*cutoff*reach*uHeadGain*headVisibility(h,vPos,N,along)/(1.0+dist*dist/350.0);\n"
+    "      }\n"
     "    }\n"
     "  }\n"
-    /* environment reflection (cars only, uEnv>0): a procedural night-city
-       sphere — dark ground, warm city-glow horizon band, dim blue sky —
-       sampled with the world-space reflection vector, fresnel-weighted.
-       The horizon stays level when the car banks or a wheel spins. */
-    "  float fres = 0.35 + 0.65*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
+    /* Local scene cube, sampled in world space so reflections stay anchored
+       while the body banks. Fresnel adds clear-coat reflection without washing
+       the base paint into the old constant warm horizon band. */
+    "  float fres = 0.18 + 0.82*pow(1.0-clamp(dot(N,V),0.0,1.0), 3.0);\n"
     "  if(uEnv>0.001){\n"
     "    vec3 R = reflect(-V, N);\n"
     "    float up = clamp(R.z*0.5+0.5, 0.0, 1.0);\n"
-    /* stronger, wider night-city sphere: brighter sky dome and a much broader
-       warm horizon band (pow 8 -> 4). The old values topped out at 0.11, so
-       even at uEnv 0.5 the reflection never rose above the paint and the body
-       read as plastic. This gives the clear-coat something bright enough to
-       actually mirror. */
-    "    vec3 env = mix(vec3(0.03,0.03,0.05), vec3(0.10,0.14,0.24), up)\n"
-    "             + vec3(0.85,0.66,0.42)*pow(1.0-abs(R.z), 4.0);\n"
-    "    lit += env * (uEnv * fres);\n"
+    "    vec3 env = mix(vec3(0.025,0.025,0.035), vec3(0.10,0.14,0.24), up);\n"
+    "    float local=uEnvReady*(1.0-smoothstep(35.0,100.0,length(vPos-uEnvOrigin)));\n"
+    "    env=mix(env,textureCube(uEnvCube,R).rgb,local);\n"
+    "    lit=mix(lit,env,clamp(uEnv*fres,0.0,0.85));\n"
     "  }\n"
     /* lit alpha = uAlpha (1 everywhere but the blended glass pass), so
        translucent glass keeps its specular highlight. M135-R: authored
@@ -520,12 +1056,12 @@ static int headlight_shadow_init(HeadlightShadows *s) {
     return s->white && glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
 }
 
-static int headlight_caster_visible(const N2Batch *b,const float m[16]) {
+int render_batch_in_view(const N2Batch *b,const float m[16]) {
     for(int axis=0;axis<3;axis++)for(int sign=-1;sign<=1;sign+=2) {
         float plane[4];for(int a=0;a<4;a++)plane[a]=m[a*4+3]+sign*m[a*4+axis];
         float best=plane[3];
         for(int a=0;a<3;a++)best+=plane[a]*(plane[a]>=0?b->bbox_max[a]:b->bbox_min[a]);
-        if(best<0)return 0;
+        if(best<-.01f)return 0;
     }
     return 1;
 }
@@ -583,7 +1119,7 @@ int render_headlight_shadows(const RProg *r,HeadlightShadows *s,const N2Batch *b
         for(int i=0;i<count;i++) {
             const N2Batch *b=batches+i;
             if(b->drawmode!=N2_DRAW_OPAQUE && b->drawmode!=N2_DRAW_CUTOUT)continue;
-            if(!headlight_caster_visible(b,matrices[h]))continue;
+            if(!render_batch_in_view(b,matrices[h]))continue;
             glBindTexture(GL_TEXTURE_2D,b->tex?b->tex:s->white);
             glUniform1f(s->cutout,b->tex && b->drawmode==N2_DRAW_CUTOUT?1.0f:0.0f);
             draw_batch(b);draws++;
@@ -680,7 +1216,21 @@ RProg render_program(void) {
     r.uFogColor   = glGetUniformLocation(r.prog, "uFogColor");
     r.uFogDensity = glGetUniformLocation(r.prog, "uFogDensity");
     r.uCamPos = glGetUniformLocation(r.prog, "uCamPos");
+    r.uRoadReflection=glGetUniformLocation(r.prog,"uRoadReflection");
+    r.uReflectionParams=glGetUniformLocation(r.prog,"uReflectionParams");
+    glUniform1i(glGetUniformLocation(r.prog,"uReflectionColor"),3);
+    glUniform1i(glGetUniformLocation(r.prog,"uReflectionDepth"),4);
+    r.uWetLightPos = glGetUniformLocation(r.prog,"uWetLightPos[0]");
+    r.uWetLightColor = glGetUniformLocation(r.prog,"uWetLightColor[0]");
+    r.uPaintLights = glGetUniformLocation(r.prog,"uPaintLights");
+    r.uWetness = glGetUniformLocation(r.prog,"uWetness");
+    r.uWeatherTime = glGetUniformLocation(r.prog,"uWeatherTime");
+    r.uRainIntensity = glGetUniformLocation(r.prog,"uRainIntensity");
     r.uEnv    = glGetUniformLocation(r.prog, "uEnv");
+    r.uEnvCube = glGetUniformLocation(r.prog,"uEnvCube");
+    r.uEnvReady = glGetUniformLocation(r.prog,"uEnvReady");
+    r.uEnvOrigin = glGetUniformLocation(r.prog,"uEnvOrigin");
+    glUniform1i(r.uEnvCube,5);glUniform1f(r.uEnvReady,0);
     r.uUVCheck = glGetUniformLocation(r.prog, "uUVCheck");
     r.uAmbient = glGetUniformLocation(r.prog, "uAmbient");
     r.uDiffuse = glGetUniformLocation(r.prog, "uDiffuse");
@@ -982,6 +1532,7 @@ static int batch_emit(const N2Scene *s, const BSortEnt *ent, int i0, int i1,
         memset(b, 0, sizeof *b); free(bv); free(bi); return 0;
     }
     b->index_count = ni; b->tex = tex; b->nmesh = i1 - i0; b->emit_idx = bidx;
+    b->wettable = s->meshes[ent[i0].idx].cat == N2_ROAD;
     b->texkey = s->meshes[ent[i0].idx].texkey;
     b->drawmode = mtexmode ? mtexmode[ent[i0].idx] : N2_DRAW_OPAQUE;
     int named = 0;
@@ -1061,8 +1612,9 @@ WorldBatchUpload *upload_world_batches_begin(const N2Scene *s,
                                            + (int)((cx-x0)/BATCH_CELL));
         ent[m].key = cell << 32 | tex; ent[m].idx = i;
         int mode = mtexmode ? mtexmode[i] : N2_DRAW_OPAQUE;
+        /* Keep wettable roads separate even when walls share their texture. */
         ent[m].group = (unsigned char)n2_world_batch_material_group(
-            &s->meshes[i], mode);
+            &s->meshes[i], mode) | (mesh->cat == N2_ROAD ? 128 : 0);
         m++;
     }
     qsort(ent, (size_t)m, sizeof *ent, bsort_cmp);
@@ -1308,8 +1860,8 @@ void draw_gpumesh(GpuMesh *g) {
 
 void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) {
     const GLint loc[]={r->uUseTex,r->uAlphaTest,r->uTextureAlpha,r->uAlpha,r->uDecal,
-                       r->uRimTint,r->uSpec,r->uEnv,r->uClearcoat};
-    float saved[9];for(int i=0;i<9;i++)glGetUniformfv(r->prog,loc[i],saved+i);
+                       r->uRimTint,r->uSpec,r->uEnv,r->uClearcoat,r->uVColor};
+    float saved[10];for(int i=0;i<10;i++)glGetUniformfv(r->prog,loc[i],saved+i);
     GLint oldtex,src,dst,srca,dsta;
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&oldtex);
     glGetIntegerv(GL_BLEND_SRC_RGB,&src);glGetIntegerv(GL_BLEND_DST_RGB,&dst);
@@ -1323,7 +1875,9 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
        alpha discard breaks the generated round backing into black facets.
        Keep its authored RGB (usually black) but make the backing continuous;
        TIRE and RIM retain their authored cutout textures. */
-    if (mesh->car_material == N2_MAT_INTERIOR) cut = 0;
+    /* Prelit traffic wheels use a cutout quad for the visible wheel face. */
+    if (mesh->car_material == N2_MAT_INTERIOR && !mesh->cbo) cut = 0;
+    glUniform1f(r->uVColor,mesh->cbo?2.0f:0.0f);
     glBindTexture(GL_TEXTURE_2D,texture);
     glUniform1f(r->uUseTex,texture?1.0f:0.0f);
     glUniform1f(r->uAlphaTest,cut?1.0f:0.0f);
@@ -1340,7 +1894,7 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     if(translucent){glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);}
     else glDisable(GL_BLEND);
     draw_gpumesh(mesh);
-    for(int i=0;i<9;i++)glUniform1f(loc[i],saved[i]);
+    for(int i=0;i<10;i++)glUniform1f(loc[i],saved[i]);
     glBindTexture(GL_TEXTURE_2D,(GLuint)oldtex);
     glBlendFuncSeparate((GLenum)src,(GLenum)dst,(GLenum)srca,(GLenum)dsta);
     if(blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);

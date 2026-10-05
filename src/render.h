@@ -56,6 +56,7 @@ typedef struct {
                              an untextured mesh must not vanish because a
                              neighbour in its cell lost its texture. */
     GLuint tex;               /* resolved GL texture (0 = untextured fallback) */
+    unsigned char wettable;  /* road-only batch; upward faces receive wet shading */
     int nmesh;                /* source meshes merged in (drawn-mesh metric) */
     int scen_count[8];        /* source N2_SC_* membership (visibility audit) */
     int emit_idx;             /* pre-sort emission index: upload_world_batches
@@ -88,6 +89,7 @@ typedef struct {
                                        (authored sky and point-light sprites) */
           uFogColor, uFogDensity,   /* exp^2 distance fog (matches the sky) */
           uCamPos,  /* camera in world space */
+          uEnvCube, uEnvReady, uEnvOrigin,
           uEnv,     /* environment-reflection amount (cars only) */
           uUVCheck, /* 1 = show the diagnostic UV-coordinate visualization
                        instead of lighting/texture (toggle lives in the
@@ -107,6 +109,8 @@ typedef struct {
                         plastic. Dome-weighted by dot(N,V) in the shader, so a
                         curved lens is hottest where it faces the camera.
                         Zero everywhere else; the car pass clears it. */
+    GLint uWetness, uWeatherTime, uRainIntensity, uWetLightPos, uWetLightColor, uPaintLights;
+    GLint uRoadReflection, uReflectionParams;
     GLint uHeadPos, uHeadForward, uHeadRight, uHeadUp, uHeadShape, uHeadGain, uHeadLow;
     GLint uHeadShadow, uHeadShadowMap[2], uHeadShadowMVP;
 } RProg;
@@ -127,6 +131,56 @@ void render_headlights(const RProg *r, const float model[16], const float anchor
  * disable emission. Brake lamps work independently of night running lights. */
 void render_tail_lamp(const RProg *r,GLuint texture,int running,int braking,
                       int boost,float gain);
+
+typedef struct { GLuint color, depth; int width, height, failed; } RoadReflections;
+/* Copy the current world color/depth before rain/HUD, then reflect visible
+ * geometry onto wet roads. 0 = disabled/no receivers, -1 = unavailable.
+ * Restores pass state and texture bindings; next draw establishes mesh inputs. */
+int render_road_reflections(const RProg *r,RoadReflections *s,
+                           const N2Batch *batches,int count,const float cam[3],
+                           const float mvp[16],const float projection[16],
+                           float wetness,int quality);
+void free_road_reflections(RoadReflections *s);
+
+typedef struct {
+    GLuint fbo, depth, cube[2];
+    RProg capture;
+    int size, face, front, ready, failed, ticks;
+    float origin[3], published[3];
+} CarEnvironment;
+/* At most one face per call (Medium every second frame after warmup).
+ * Publish only complete six-face captures. Low skips capture.
+ * Shared local probe: far traffic fades to the sky, no per-car scene passes. */
+int render_car_environment(const RProg *r,CarEnvironment *s,const N2Batch *world,int count,
+                           const N2Batch *sky,int nsky,const float pos[3],int quality);
+void free_car_environment(CarEnvironment *s);
+
+typedef struct { GLuint body, wheel, body_key, wheel_key; int body_count, wheel_count; } CarShadow;
+/* Caller clears the frame stencil and binds r. Leaves ordinary opaque state;
+ * next draw establishes its material/model/attributes. Stencil prevents
+ * overlapping caster triangles from darkening the same pixel twice. */
+int render_car_shadow(const RProg *r,CarShadow *s,const N2Scene *car,const GpuMesh *gpu,
+                      int stock,const N2Scene *rims,const GpuMesh *rim_gpu,
+                      const float model[16],const float wheels[4][16],const float mvp[16],
+                      const float ground[3],const float normal[3],int quality);
+void free_car_shadow(CarShadow *s);
+void mat_ground_shadow(const float ground[3],const float normal[3],float m[16]);
+/* One simulation tick, normalized movement; independent of the player pose. */
+void render_free_camera(float eye[3],float yaw,float pitch,const float move[3],float speed,float look[3]);
+
+/* Bounded highlights from authored district lamps; no scene mirror pass. */
+void render_wet_lights(const RProg *r,const N2LightSrc *lights,int count,
+                       const float cam[3],float gain,int quality);
+/* Shared conservative bounds test for camera draws and headlight casters. */
+int render_batch_in_view(const N2Batch *b,const float mvp[16]);
+/* One lens overlay draw; no scene copy or depth reads. Caller owns/deletes vbo.
+ * vertices returns a count, out has room for RAIN_MAX_DROPS * 6 vertices.
+ * Restores uniforms/depth/blend/cull state; next draw establishes mesh inputs. */
+#define RAIN_MAX_DROPS 48
+typedef struct { float pos[3], uv[2], fade; } RainVertex;
+int render_rain_exposed(const N2Scene *scene,const float (*bounds)[4],const float cam[3]);
+int render_rain_vertices(float time,float intensity,int quality,float aspect,RainVertex *out);
+int render_rain(const RProg *r,GLuint *vbo,float time,float intensity,int quality,float aspect);
 
 /* world-space sun direction (night scene key light) */
 #define N2_SUN_X 0.4f

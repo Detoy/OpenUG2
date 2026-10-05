@@ -5,6 +5,7 @@
 #ifndef OPENUG2_DEBUG_H
 #define OPENUG2_DEBUG_H
 #include "car_config.h"
+#include "traffic_heatmap.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -90,6 +91,9 @@ typedef struct {
     int   freecam;
     float speed;                 /* reserved legacy inspector value */
 
+    TrafficHeatmap heatmap;
+    int heat_record,heat_clear,heat_layer,heat_local,heat_height,heat_racers;
+    float heat_span; /* local map width in metres */
     int traffic_target, traffic_max; /* requested ambient count; engine limit */
     int traffic_active, traffic_racers, traffic_available; /* live readouts */
     int traffic_cull_off; /* diagnostic: draw every AI car even when outside the view */
@@ -116,6 +120,9 @@ typedef struct {
     float low_beam_pitch, high_beam_pitch, low_beam_range, high_beam_range;
     float headlight_gain, headlight_lens_alpha;
     int headlight_shadows, headlight_shadow_draws;
+    float rain_intensity, road_wetness;
+    int road_reflections, road_reflection_draws;
+    int weather_quality; /* 0/1/2: 12/24/48 screen droplets, 0/4/8 wet lamp highlights */
     float ambient, diffuse, body_spec;
     float body_env;   /* multiplier on the body/misc env-reflection strength (clearcoat sheen) */
     float vcolor;   /* 0..1 strength of world per-vertex prelight (baked AO/tint) */
@@ -130,7 +137,8 @@ typedef struct {
     float fog_r, fog_g, fog_b;  /* fog + sky-clear colour (kept identical) */
 
     /* --- car appearance --- */
-    int   vehicle_quality;       /* 0 low, 1 medium/current, 2 high paint/glass response */
+    int   vehicle_quality;       /* 0 Low, 1 Medium, 2 High: paint/glass, scene capture and car shadows */
+    int   paint_shine;           /* authored streetlight highlights on painted panels */
     int   paint_override;        /* 1 = use paint[] below instead of the per-car hash */
     float paint[3];
     int   show_body, show_glass, show_lights, show_tires, show_misc, show_track;

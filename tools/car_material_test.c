@@ -108,9 +108,15 @@ static void physics_attr_test(void) {
     root=valid;root.b[24+0x138]=3;
     chk("wrong wheel index is rejected",!n2_global_car_shape(root.b,root.n,"TESTCAR",&shape));
     root=valid;f=4.2f;memcpy(root.b+24+0x120,&f,4);
-    chk("large source axle is reportable without relaxing live wheel bounds",
+    chk("axle outside body proportions is rejected",
         n2_global_car_shape(root.b,root.n,"TESTCAR",&shape)&&
         shape.wheel[0].x==4.2f&&!n2_global_wheel_attr(root.b,root.n,"TESTCAR",&wheel));
+    memcpy(root.b+24+0x150,&f,4); /* mirrored front wheel */
+    f=9.4f;memcpy(root.b+24+0x224,&f,4);
+    chk("long traffic vehicle accepts its authored axle",
+        n2_global_wheel_attr(root.b,root.n,"TESTCAR",&wheel)&&wheel.front_axle==4.2f);
+    f=4.1f;memcpy(root.b+24+0x150,&f,4);
+    chk("mismatched axle pair is rejected",!n2_global_wheel_attr(root.b,root.n,"TESTCAR",&wheel));
 }
 
 /* Optional local-data check: ./build/car_material_test ../GLOBAL/GLOBALB.BUN.
@@ -124,9 +130,11 @@ static void real_car_table_test(const char *file) {
     int count=0;
     for(long at=table.beg;at<table.end;at+=N2_GLOBAL_CAR_STRIDE) {
         char name[33];memcpy(name,d+at,32);name[32]=0;
-        N2CarShapeAttr a;N2PhysicsAttr p;
+        N2CarShapeAttr a;N2PhysicsAttr p;N2WheelAttr w;
         int ok=n2_global_car_shape(d,len,name,&a)&&a.record_offset==at&&
-               n2_global_physics_attr(d,len,name,&p)&&p.mass_tonnes==a.mass_tonnes;
+               n2_global_physics_attr(d,len,name,&p)&&p.mass_tonnes==a.mass_tonnes&&
+               n2_global_wheel_attr(d,len,name,&w)&&w.front_axle==a.wheel[0].x&&
+               w.rear_axle==a.wheel[2].x;
         if(ok) {
             for(int k=0;k<3;k++) {
                 float b=a.body[(k+1)%3],c=a.body[(k+2)%3];

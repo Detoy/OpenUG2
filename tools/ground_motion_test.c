@@ -91,6 +91,7 @@ static void slope_contact(float grade, float heading, float step, int reverse) {
         s.ax[k]=k<2?1.2f:-1.2f;s.ay[k]=(k&1)?-.7f:.7f;
         s.z[k]=grade*s.ax[k];s.valid[k]=1;
     }
+    s.pitch_limit=fabsf(grade);
     phys_ride_init(&r,&s);r.vz=grade*step/dt;
     int air=0,partial=0,missing=0;float maxerr=0;
     for(int f=1;f<=600;f++) {
@@ -107,6 +108,7 @@ static void slope_contact(float grade, float heading, float step, int reverse) {
             s.vz[k]=0; /* Original damper used absolute wheel-Z velocity. */
 #endif
         }
+        s.pitch_limit=fabsf(grade); /* normal of this actual synthetic road */
         phys_ride_step(&r,&s,dt);
         if(!r.contact_mask)air++;
         if(r.contact_mask!=15)partial++;
@@ -151,8 +153,76 @@ static void camera_collision_test(void) {
     puts("camera sweep: PASS (two-sided walls, edges, clearance, floor/ceiling, long moves)");
 }
 
+static void overlapping_ramp(float grade) {
+    float floor[]={-20,-10,0,0,0,80,-10,0,0,0,80,10,0,0,0,-20,10,0,0,0};
+    float ramp[]={0,-10,0,0,0,80,-10,12,0,0,80,10,12,0,0,0,10,0,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh m[]={{.verts=floor,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD},
+                {.verts=ramp,.nverts=4,.idx=idx,.nidx=6,.cat=N2_TERRAIN}};
+    N2Scene sc={m,2,2}; WGroundHit h;
+    for(int k=0;k<4;k++)ramp[k*5+2]=grade*ramp[k*5];
+    for(int order=0;order<2;order++) {
+        assert(world_wheel_support(&sc,.15f/grade,0,0,.25f,.3f,&h,NULL,NULL));
+        close_to(h.z,.15f);
+        N2Mesh tmp=m[0];m[0]=m[1];m[1]=tmp;
+    }
+    /* Nearby flat stacked layers still choose closest; unreachable ramps are
+     * never recovery targets, and a real falling wheel remains unsupported. */
+    for(int k=0;k<4;k++)ramp[k*5+2]=.15f;
+    assert(world_wheel_support(&sc,1,0,0,.25f,.3f,&h,NULL,NULL));close_to(h.z,0);
+    /* A near-vertical retaining face cannot take ramp priority over a floor. */
+    for(int k=0;k<4;k++)ramp[k*5+2]=30*ramp[k*5]-29.85f;
+    assert(world_wheel_support(&sc,1,0,0,.25f,.3f,&h,NULL,NULL));close_to(h.z,0);
+    for(int k=0;k<4;k++)ramp[k*5+2]=3+.15f*ramp[k*5];
+    assert(world_wheel_support(&sc,1,0,0,.25f,.3f,&h,NULL,NULL));close_to(h.z,0);
+    assert(!world_wheel_support(&sc,1,0,8,.25f,.3f,&h,NULL,NULL));
+    for(int k=0;k<4;k++)ramp[k*5+2]=grade*ramp[k*5];
+    PhysRideSupport sup={.ax={1.2f,1.2f,-1.2f,-1.2f},.ay={.7f,-.7f,.7f,-.7f}};
+    float pos[3]={-3,0,0},vel[2]={.05f,0},heading=0;
+    world_ride_gather(&sc,pos,0,vel,0,NULL,&sup,NULL,NULL,NULL);
+    PhysRideState r;phys_ride_init(&r,&sup);
+    for(int f=0;f<400;f++) {
+        float old[3]={pos[0],pos[1],pos[2]};pos[0]+=.05f;vel[0]=.05f;
+        ground_motion_limit(&sc,&r,&sup,old,0,pos,&heading,vel,NULL);
+        world_ride_gather(&sc,pos,0,vel,0,&r,&sup,NULL,NULL,NULL);
+        phys_ride_step(&r,&sup,1.0f/60);pos[2]=r.z;
+        assert(r.contact_mask && isfinite(r.z));
+    }
+    printf("overlapping ramp: x=%.3f z=%.3f\n",pos[0],pos[2]);
+    assert(pos[0]>16 && pos[2]>2);
+}
+
+static void ramp_edge_wall(void) {
+    /* Terrain retaining walls exceed the old low-rail ceiling. Their real
+       face, clipped to body height, must stop a car before support is lost. */
+    float v[]={0,-20,0,0,0,0,20,0,0,0,0,20,8,0,0,0,-20,8,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh m={.verts=v,.nverts=4,.idx=idx,.nidx=6,.cat=N2_TERRAIN};
+    N2Scene sc={&m,1,1};float bounds[1][4]={{0,-20,0,20}};WGroundGrid grid={0};
+    assert(world_ground_grid_build(&grid,&sc,bounds));world_ground_grid_activate(&grid);
+    const float bb[]={-1.97f,-.94f,0,1.97f,.94f,1.37f};
+    for(int side=-1;side<=1;side+=2) {
+        float p[]={side*1.8f,0,2},vel[]={-side*.3f,.1f};
+        assert(world_body_wall_push(&sc,p,vel,0,bb,2.1f,3.37f,NULL));
+        assert(side*p[0]>=1.969f);close_to(vel[0],0);close_to(vel[1],.1f);
+        assert(!world_wall_clear_at(&sc,side*.5f,0,2,.75f));
+        p[0]=side*1.8f;p[2]=10;vel[0]=-side*.3f;
+        assert(!world_body_wall_push(&sc,p,vel,0,bb,10.1f,11.37f,NULL));
+    }
+    /* A thin curb can gain metres along a hill without becoming a wall. */
+    v[7]=v[12]=5;v[17]=.1f;v[12]+=.1f;
+    float p[]={.5f,0,2.5f},vel[]={-.3f,0};
+    assert(!world_body_wall_push(&sc,p,vel,0,bb,2.5f,3.87f,NULL));
+    world_ground_grid_free(&grid);
+    puts("ramp edge: tall terrain walls, both sides, height clipping and passable curb PASS");
+}
+
 int main(void) {
+    ramp_edge_wall();
+    overlapping_ramp(.15f);overlapping_ramp(.40f);
+    slope_contact(.40f,0,.05f,0);
     camera_collision_test();
+    slope_spawn(.40f,0);
     slope_spawn(.08f,0);slope_spawn(-.08f,1.2f);
     /* A road closure is a finite segment, not a nine-metre-deep slab.
      * Entering beside its far side must not teleport a car under a slope. */

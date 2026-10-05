@@ -201,7 +201,7 @@ builds compile the panel out entirely, so none of this is reachable there —
 | **Lighting & Environment** | Night mode, headlight beam preview, beam pitch/reach/intensity, lens opacity, headlight shadows, street/district flare size and brightness, chase-camera distance/height/stiffness, ambient/diffuse/fog. |
 | **World & Entities** | Live traffic density (0–16 cars, default 4), active traffic/racer counts, loaded track selector, scenery semantics census, nearby world chunks, decoded `ZCV_`/`ZCS_` entity definitions, UV checker, HUD toggle. |
 | **Placement Marks** | Report a misplaced object by driving to it. Live probe readout (world XYZ, the ground selector's surface height and category, the covering chunk's asset name, district), then `F9` marks the defect and `F10` marks where it should be. Marks carry a note, list colour-coded, and go to the clipboard or `placement_marks.txt` — and every mark is echoed to stdout, so nothing is lost if the session ends. |
-| **Engine Telemetry** | FPS and frame time, draw calls, car/track mesh counts, active district, camera and car coordinates, heading and speed, orbit camera. |
+| **Engine Telemetry** | FPS and frame time, draw calls, car/track mesh counts, active district, camera and car coordinates, heading and speed, free camera. |
 | **Navigation & Races** | Top-down nav graph drawn from the authored route files, district colouring, right-click GPS routing, the shipped race-event catalog, and freeroam/race mode switching with a live race HUD. |
 
 The Modification subtabs follow the retail shop colours:
@@ -210,7 +210,7 @@ The Modification subtabs follow the retail shop colours:
 | --- | --- |
 | **Body** (green) | Front/rear bumpers, skirts, hood, headlight and taillight assemblies, spoiler, exhaust, roof scoop; full body-kit presets; wheel brand and rim style from the `CARS/WHEELS` library. |
 | **Specialties** (yellow) | Trunk audio, neon underglow (on/off, colour, intensity). |
-| **Graphics** (red) | Body paint with clear-coat, highlight and reflection controls; rim paint with chrome/OEM/gunmetal presets. |
+| **Graphics** (red) | Body paint with clear-coat, highlight and reflection controls, plus streetlight paint shine and local city reflections (Medium/High vehicle detail); Low uses a square vehicle shadow, Medium/High project the model silhouette; rim paint with chrome/OEM/gunmetal presets. |
 | **Performance** (blue) | Source power-curve and transmission levels, applied live; exact ECU/engine/turbo product mapping and the remaining packages are still being decoded. |
 | **Safe House** (purple) | Read-only list of installed parts; ownership and saving are not implemented. |
 
@@ -280,7 +280,7 @@ frontend; the asset-backed menu is documented in
 milestone.
 
 **Controls:** driving — `W`/`S` throttle/brake, `A`/`D` steer, `Space` handbrake (breaks rear
-grip for drifts), hold **right mouse** and drag to orbit the car (`F` latches orbit), `L` high beam, `J` headlight flash
+grip for drifts), hold **right mouse** and drag to orbit the car (press **F** for map free flight: **WASD**, **Q/E**, **Shift** for speed), `L` high beam, `J` headlight flash
 (racer invitations are not implemented yet), `N` nitro, **`1` developer menu** (the ImGui Master Inspector, in
 `make debug` builds), `F6` cycle rim style
 (once per press), `K` cycle body kit, `Esc` quit. Cars

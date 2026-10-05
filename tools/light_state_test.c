@@ -118,6 +118,33 @@ int main(void) {
         else assert(out[0]>0 && out[1]>0 && out[2]>0);
         assert(glGetError()==GL_NO_ERROR);
     }
+    /* A wall 20 cm in front of the authored light must occlude its halo.
+       A size-scaled camera offset used to pull the sprite through that wall. */
+    glBindTexture(GL_TEXTURE_2D,tex[0]);
+    glTexSubImage2D(GL_TEXTURE_2D,0,0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+    glUniform1f(r.uFogDensity,0);
+    for(int angle=0;angle<4;angle++)for(int far=0;far<2;far++)for(int blocked=0;blocked<2;blocked++) {
+        float co=cosf(angle*1.570796327f),sn=sinf(angle*1.570796327f);
+        float distance=far?30:3;
+        float eye[]={-co*distance,-sn*distance,0},direction[]={co,sn,0};
+        float projection[16],view[16],world[16];
+        mat_persp(.9f,1,.1f,200,projection);mat_lookat(eye,direction,view);mat_mul(projection,view,world);
+        glDepthMask(GL_TRUE);glClearDepth(1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);glDisable(GL_BLEND);
+        if(blocked) {
+            float wall[]={-sn*4,co*4,0,0, 0,0,4,0, co,sn,0,0,
+                          -co*.2f+sn*2,-sn*.2f-co*2,-2,1};
+            float wall_mvp[16];mat_mul(world,wall,wall_mvp);
+            glUniformMatrix4fv(r.uMVP,1,GL_FALSE,wall_mvp);
+            glUniform1f(r.uUseTex,0);glUniform1f(r.uUnlit,1);glUniform1f(r.uEmissiveTex,0);
+            glUniform1f(r.uSoft,0);glUniform1f(r.uAlpha,1);glUniform3f(r.uColor,0,0,0);
+            draw_gpumesh(&quad);
+        }
+        N2LightSrc lamp={{0,0,0},10,50,0xffffffffu};
+        assert(render_district_lights(&r,&quad,tex[0],&lamp,1,eye,direction,world,100,1,1)==1);
+        unsigned char out[4];glReadPixels(16,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,out);
+        assert(blocked?(out[0]==0 && out[1]==0 && out[2]==0):out[0]>50);
+    }
     /* A preceding car halo/smoke draw leaves its local MVP behind. World
        glows must remain at their authored position and add no fog rectangle. */
     BatchedVertex bv[4]={0};uint16_t bi[]={0,1,2,0,2,3};

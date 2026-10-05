@@ -3007,15 +3007,18 @@ typedef struct { float front_axle, rear_axle, front_track, rear_track; } N2Wheel
 static int n2_global_wheel_attr(const unsigned char *g, long glen,
                                 const char *carname, N2WheelAttr *w) {
     if (!w) return 0;
-    long base = n2_global_car_record(g,glen,carname);
-    if (base < 0 || base + 392 + 4 > glen) return 0;
-    float fx, rx, fy, ry;                        /* front/rear axle X, front/rear half-track Y */
-    memcpy(&fx, g + base + 288, 4); memcpy(&rx, g + base + 384, 4);
-    memcpy(&fy, g + base + 292, 4); memcpy(&ry, g + base + 388, 4);
-    fy = fy < 0 ? -fy : fy; ry = ry < 0 ? -ry : ry;
-    /* sanity-gate to real car proportions so a mismatched record can't misplace */
-    if (!(fx > 0.3f && fx < 2.5f && rx < -0.3f && rx > -2.5f &&
-          fy > 0.4f && fy < 1.3f && ry > 0.4f && ry < 1.3f)) return 0;
+    N2CarShapeAttr shape;
+    if (!n2_global_car_shape(g,glen,carname,&shape)) return 0;
+    for (int k=0;k<4;k+=2) {
+        const N2WheelShapeAttr *a=&shape.wheel[k], *b=&shape.wheel[k+1];
+        if (fabsf(a->x-b->x)>0.001f || fabsf(a->y+b->y)>0.001f) return 0;
+        /* Source body dimensions also admit long/wide traffic vehicles. */
+        if (fabsf(a->x)>fmaxf(2.5f,shape.body[0]*0.5f+a->radius) ||
+            fabsf(a->y)>fmaxf(1.3f,shape.body[1]*0.5f+a->width)) return 0;
+    }
+    float fx=shape.wheel[0].x, rx=shape.wheel[2].x;
+    float fy=fabsf(shape.wheel[0].y), ry=fabsf(shape.wheel[2].y);
+    if (!(fx>0.3f && rx< -0.3f && fy>0.4f && ry>0.4f)) return 0;
     w->front_axle = fx; w->rear_axle = rx;
     w->front_track = 2.0f * fy; w->rear_track = 2.0f * ry;
     return 1;
