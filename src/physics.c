@@ -95,7 +95,8 @@ void phys_ride_init(PhysRideState *r, const PhysRideSupport *s) {
         float ap = r->pitch < 0 ? -r->pitch : r->pitch;
         float ar = r->roll  < 0 ? -r->roll  : r->roll;
         if (res > PHYS_RIDE_PLANE_SPREAD ||
-            ap > PHYS_RIDE_MAXTILT || ar > PHYS_RIDE_MAXTILT) {
+            ap > fmaxf(PHYS_RIDE_MAXTILT,s->pitch_limit) ||
+            ar > fmaxf(PHYS_RIDE_MAXTILT,s->roll_limit)) {
             r->pitch = 0; r->roll = 0;       /* unrelated layers: stay level */
         }
     }
@@ -131,6 +132,11 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
     const float C    = 2.0f * PHYS_RIDE_ZETA * w;      /* 1/s                   */
     float ax[4], ay[4], ip, ir; pr_axes(s, ax, ay, &ip, &ir);
 
+    /* The generic attitude guard must not flatten a real authored incline.
+       Preserve its previous attitude in flight; only reachable road normals
+       can enlarge the bound while two or more tyres carry load. */
+    float pitch_limit=fmaxf(PHYS_RIDE_MAXTILT,fabsf(r->pitch));
+    float roll_limit=fmaxf(PHYS_RIDE_MAXTILT,fabsf(r->roll));
     unsigned was = r->contact_mask;
     r->impact = 0.0f;
     r->lift   = 0.0f;
@@ -161,6 +167,10 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         if(force[k]>0)mask |= 1u << k;
     }
     r->contact_mask = mask;
+    if(mask && (mask & (mask-1))) {
+        pitch_limit=fmaxf(pitch_limit,s->pitch_limit);
+        roll_limit=fmaxf(roll_limit,s->roll_limit);
+    }
 
     if (!mask) {                                   /* free flight */
         r->vz -= PHYS_RIDE_G * dt;
@@ -188,10 +198,10 @@ void phys_ride_step(PhysRideState *r, const PhysRideSupport *s, float dt) {
         r->air_frames = 0;
     }
 
-    if (r->pitch >  PHYS_RIDE_MAXTILT) { r->pitch =  PHYS_RIDE_MAXTILT; if (r->pitch_rate > 0) r->pitch_rate = 0; }
-    if (r->pitch < -PHYS_RIDE_MAXTILT) { r->pitch = -PHYS_RIDE_MAXTILT; if (r->pitch_rate < 0) r->pitch_rate = 0; }
-    if (r->roll  >  PHYS_RIDE_MAXTILT) { r->roll  =  PHYS_RIDE_MAXTILT; if (r->roll_rate  > 0) r->roll_rate  = 0; }
-    if (r->roll  < -PHYS_RIDE_MAXTILT) { r->roll  = -PHYS_RIDE_MAXTILT; if (r->roll_rate  < 0) r->roll_rate  = 0; }
+    if (r->pitch >  pitch_limit) { r->pitch =  pitch_limit; if (r->pitch_rate > 0) r->pitch_rate = 0; }
+    if (r->pitch < -pitch_limit) { r->pitch = -pitch_limit; if (r->pitch_rate < 0) r->pitch_rate = 0; }
+    if (r->roll  >  roll_limit) { r->roll  =  roll_limit; if (r->roll_rate  > 0) r->roll_rate  = 0; }
+    if (r->roll  < -roll_limit) { r->roll  = -roll_limit; if (r->roll_rate  < 0) r->roll_rate  = 0; }
 
     /* bump stop: no wheel may end the frame compressed past its travel, so the
        body can never settle through a surface it is standing on. */

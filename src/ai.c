@@ -12,6 +12,7 @@
 
 AiPerf g_ai_perf;
 AiAuditHook g_ai_audit_hook;
+AiContactHook g_ai_contact_hook;
 
 static void ai_motion_init(AiCar *car,const AiTrafficWorld *world) {
     car->vel[0]=cosf(car->head)*car->spd;car->vel[1]=sinf(car->head)*car->spd;
@@ -58,6 +59,7 @@ static void ai_vehicle_step(AiCar *car,float throttle,float steer,int handbrake,
         float hw=car->half_width>.5f?car->half_width:1.0f;
         float height=car->height>1?car->height:1.6f;
         float bb[6]={-hl,-hw,0,hl,hw,height};
+        float contact_before[3];memcpy(contact_before,car->pos,sizeof contact_before);
         if(world->obst && world->obstsrc) {
             g_ai_perf.wall_candidates+=world->nobst;
             collide_body_walls(car->pos,car->vel,car->head,bb,world->obst,
@@ -66,6 +68,7 @@ static void ai_vehicle_step(AiCar *car,float throttle,float steer,int handbrake,
         }
         world_body_wall_push(scene,car->pos,car->vel,car->head,bb,
                              car->pos[2]+.05f,car->pos[2]+height,NULL);
+        if(g_ai_contact_hook)g_ai_contact_hook(contact_before,car->pos,0);
         world_ride_gather(scene,car->pos,car->head,car->vel,oldh,&car->ride,
                           &car->support,NULL,NULL,NULL);
     }
@@ -104,6 +107,7 @@ static void ai_contact_world(AiCar *car,const float old[3],const AiTrafficWorld 
         if(car->ride_ready)
             ground_motion_limit(world->scene,&car->ride,&car->support,before,head,
                                 car->pos,&head,car->vel,NULL);
+        float contact_before[3];memcpy(contact_before,car->pos,sizeof contact_before);
         g_ai_perf.world_fixes++;
         if(world->obst && world->obstsrc) g_ai_perf.wall_candidates+=world->nobst;
         if(world->obst && world->obstsrc)
@@ -112,6 +116,7 @@ static void ai_contact_world(AiCar *car,const float old[3],const AiTrafficWorld 
                 world->scene,world->obstsrc,NULL,0);
         world_body_wall_push(world->scene,car->pos,car->vel,car->head,bb,
                              car->pos[2]+.05f,car->pos[2]+bb[5],NULL);
+        if(g_ai_contact_hook)g_ai_contact_hook(contact_before,car->pos,0);
     }
 }
 
@@ -126,6 +131,9 @@ static float ai_car_contact(AiCar *a,AiCar *b,const AiTrafficWorld *world) {
         g_ai_perf.pairs++;
         if(!hit)break;
         g_ai_perf.hits++;
+        if(g_ai_contact_hook) {
+            g_ai_contact_hook(olda,a->pos,1);g_ai_contact_hook(oldb,b->pos,1);
+        }
         thud=fmaxf(thud,hit);
         float targeta[3]={a->pos[0],a->pos[1],a->pos[2]};
         float targetb[3]={b->pos[0],b->pos[1],b->pos[2]};
@@ -140,6 +148,9 @@ static float ai_car_contact(AiCar *a,AiCar *b,const AiTrafficWorld *world) {
             memcpy(olda,a->pos,sizeof olda);memcpy(oldb,b->pos,sizeof oldb);
             a->pos[0]-=blocked_b*nx;a->pos[1]-=blocked_b*ny;
             b->pos[0]+=blocked_a*nx;b->pos[1]+=blocked_a*ny;
+            if(g_ai_contact_hook) {
+                g_ai_contact_hook(olda,a->pos,1);g_ai_contact_hook(oldb,b->pos,1);
+            }
             float closing=(a->vel[0]-b->vel[0])*nx+(a->vel[1]-b->vel[1])*ny;
             if(closing>0) {
                 if(blocked_b>.00001f){a->vel[0]-=closing*nx;a->vel[1]-=closing*ny;}
@@ -365,7 +376,7 @@ int ai_roads_load(AiRoadNet *roads,const char *troot) {
     return roads->n;
 }
 
-/* traffic_next only considers edges whose start is `at` (authored pass) or
+/* ai_road_next only considers edges whose start is `at` (authored pass) or
  * whose endpoint lies within 65 m of `at` (junction pass: gap <= 5 m on an
  * edge <= 60 m). The grid cell is wider than that, so a 3x3 neighbourhood is
  * a superset; candidates are visited in ascending index like the linear scan. */
@@ -407,7 +418,7 @@ int ai_roads_index(AiRoadNet *r) {
 static int ai_int_cmp(const void *a,const void *b) {
     int x=*(const int *)a,y=*(const int *)b;return (x>y)-(x<y);
 }
-/* Sorted candidate node indices for traffic_next's pass, or -1 = scan all. */
+/* Sorted candidate node indices for ai_road_next's pass, or -1 = scan all. */
 static int ai_road_candidates(const AiRoadNet *r,int at,int pass,int *out,int cap) {
     if(!r->pred_start || !r->cell_start)return -1;
     int n=0;
@@ -433,11 +444,13 @@ static int ai_road_candidates(const AiRoadNet *r,int at,int pass,int *out,int ca
     return u;
 }
 
-static int traffic_edge_supported(N2Scene *scene,float x,float y,float dx,float dy,float z) {
+static int traffic_edge_supported(N2Scene *scene,float x,float y,float dx,float dy,float z,
+                                  int road_only) {
     if(!scene)return 1;
     for(int q=1;q<=4;q++) {
         float nz=z;
-        if(world_ground_at(scene,x+dx*q*0.25f,y+dy*q*0.25f,z,&nz)!=WSURF_ROAD ||
+        int surface=world_ground_at(scene,x+dx*q*0.25f,y+dy*q*0.25f,z,&nz);
+        if(surface==WSURF_NONE || (road_only && surface!=WSURF_ROAD) ||
            fabsf(nz-z)>2.0f)return 0;
         z=nz;
     }
@@ -448,14 +461,17 @@ static float traffic_lane_tangent(const AiRoadNet *roads,N2Scene *scene,int from
                                   float t,float x,float y,float z,float heading,
                                   float *outx,float *outy,float *outz) {
     /* Navigation stays on the road even while the vehicle is airborne. */
-    if(scene)world_ground_at(scene,x,y,z,&z);
+    int surface=scene?world_ground_at(scene,x,y,z,&z):WSURF_ROAD;
     float width=roads->half_width
         ? roads->half_width[from]*(1.0f-t)+roads->half_width[to]*t : 4.0f;
     float offset=fminf(2.0f,width*0.45f);
     for(float side=offset;side>=0.45f;side*=0.5f) {
         float px=x+sinf(heading)*side,py=y-cosf(heading)*side,pz=z;
-        if(!scene || (world_ground_at(scene,px,py,z,&pz)==WSURF_ROAD &&
-                      fabsf(pz-z)<0.75f)) {
+        int side_surface=scene?world_ground_at(scene,px,py,z,&pz):WSURF_ROAD;
+        /* A terrain-labelled authored road still has lanes. A ROAD centre
+           must not use this allowance to steer onto a terrain shoulder. */
+        if((side_surface==WSURF_ROAD ||
+            (surface==WSURF_TERRAIN && side_surface==WSURF_TERRAIN)) && fabsf(pz-z)<0.75f) {
             *outx=px;*outy=py;*outz=pz;return side;
         }
     }
@@ -463,20 +479,13 @@ static float traffic_lane_tangent(const AiRoadNet *roads,N2Scene *scene,int from
     return 0;
 }
 
-static int traffic_pose_clear(const AiTrafficWorld *world,const AiCar *car,
-                              float x,float y,float z,float heading) {
+static int traffic_body_clear(const AiTrafficWorld *world,const AiCar *car,
+                               float x,float y,float z,float heading) {
     if(!world || !world->scene)return 1;
     N2Scene *scene=world->scene;
-    float hl=car->half_length>1?car->half_length:2.2f;
-    float hw=car->half_width>0.5f?car->half_width:1.0f;
-    float height=car->height>1?car->height:1.6f;
-    float fx=cosf(heading),fy=sinf(heading),sx=fy,sy=-fx;
-    for(int a=-1;a<=1;a+=2)for(int b=-1;b<=1;b+=2) {
-        float px=x+a*fx*hl+b*sx*hw;
-        float py=y+a*fy*hl+b*sy*hw,pz=z;
-        if(world_ground_at(scene,px,py,z,&pz)!=WSURF_ROAD ||
-           fabsf(pz-z)>1.0f)return 0;
-    }
+    float hl=car && car->half_length>1?car->half_length:2.2f;
+    float hw=car && car->half_width>0.5f?car->half_width:1.0f;
+    float height=car && car->height>1?car->height:1.6f;
     float bb[6]={-hl,-hw,0,hl,hw,height};
     float pos[3]={x,y,z},vel[2]={0,0};
     if(world->obst && world->obstsrc && world->nobst &&
@@ -487,13 +496,51 @@ static int traffic_pose_clear(const AiTrafficWorld *world,const AiCar *car,
     return !world_body_wall_push(scene,pos,vel,heading,bb,z+0.05f,z+height,NULL);
 }
 
+static int traffic_pose_clear(const AiTrafficWorld *world,const AiCar *car,
+                              float x,float y,float z,float heading) {
+    if(!world || !world->scene)return 1;
+    N2Scene *scene=world->scene;
+    float hl=car->half_length>1?car->half_length:2.2f;
+    float hw=car->half_width>0.5f?car->half_width:1.0f;
+    float fx=cosf(heading),fy=sinf(heading),sx=fy,sy=-fx;
+    for(int a=-1;a<=1;a+=2)for(int b=-1;b<=1;b+=2) {
+        float px=x+a*fx*hl+b*sx*hw;
+        float py=y+a*fy*hl+b*sy*hw,pz=z;
+        if(world_ground_at(scene,px,py,z,&pz)!=WSURF_ROAD ||
+           fabsf(pz-z)>1.0f)return 0;
+    }
+    return traffic_body_clear(world,car,x,y,z,heading);
+}
+
+/* Ground support alone does not make a road open: check the authored lane
+ * against the same static collision used by the driver, with this car's size. */
+static int traffic_edge_clear(const AiRoadNet *roads,const AiTrafficWorld *world,
+                              const AiCar *car,int from,int to,float z) {
+    if(!world || !world->scene)return 1;
+    float x=roads->xy[2*from],y=roads->xy[2*from+1];
+    float dx=roads->xy[2*to]-x,dy=roads->xy[2*to+1]-y;
+    float heading=atan2f(dy,dx);
+    int steps=(int)ceilf(hypotf(dx,dy)/2.0f);
+    for(int q=0;q<=steps;q++) {
+        float t=steps?(float)q/steps:0,px=x+dx*t,py=y+dy*t,pz=z;
+        if(world_ground_at(world->scene,px,py,z,&pz)==WSURF_NONE)return 0;
+        traffic_lane_tangent(roads,world->scene,from,to,t,px,py,pz,heading,&px,&py,&pz);
+        if(!traffic_body_clear(world,car,px,py,pz,heading))return 0;
+        z=pz;
+    }
+    return 1;
+}
+
 /* Join nearby road segments, including the middle of an edge. Stored point
  * order is not a decoded one-way rule; incoming heading selects travel direction.
  * ponytail: geometric junction policy until source lane/direction flags are known. */
-static int traffic_next(const AiRoadNet *roads,N2Scene *scene,int at,int previous,float z) {
+static int traffic_next(const AiRoadNet *roads,const AiTrafficWorld *world,const AiCar *car,
+                         int at,int previous,float z,int preview) {
+    N2Scene *scene=world?world->scene:NULL;
     if(!roads || at<0 || at>=roads->n)return -1;
     const float *xy=roads->xy;
-    if(scene && world_ground_at(scene,xy[at*2],xy[at*2+1],z,&z)!=WSURF_ROAD)return -1;
+    int surface=scene?world_ground_at(scene,xy[at*2],xy[at*2+1],z,&z):WSURF_ROAD;
+    if(surface==WSURF_NONE)return -1;
     float hx=0,hy=0;
     if(previous>=0) {
         hx=xy[at*2]-xy[previous*2];hy=xy[at*2+1]-xy[previous*2+1];
@@ -502,8 +549,11 @@ static int traffic_next(const AiRoadNet *roads,N2Scene *scene,int at,int previou
     int best=-1;float score=-1e30f;
     /* Preserve the authored chain before considering nearby junctions. A
        straighter overlapping branch must not steal a car halfway round a bend. */
-    static int cand[4096];
+    int cand[4096]; /* Recursive previews must not overwrite their caller's candidates. */
     for(int pass=0;pass<2 && best<0;pass++) {
+      /* Authored chains can cross terrain-classified ground. Joining a new
+         chain still needs ROAD support; mesh labels alone cannot invent roads. */
+      if(pass==1 && surface!=WSURF_ROAD)break;
       int nc=ai_road_candidates(roads,at,pass,cand,4096);
       for(int ci=0;ci<(nc<0?roads->n:nc);ci++) {
         int i=nc<0?ci:cand[ci];
@@ -524,17 +574,22 @@ static int traffic_next(const AiRoadNet *roads,N2Scene *scene,int at,int previou
             float len=hypotf(dx,dy);
             if(len<1.0f || len>60.0f)continue;
             if(previous>=0 && (dx*hx+dy*hy)/len<-0.15f)continue;
-            if(!traffic_edge_supported(scene,xy[at*2],xy[at*2+1],dx,dy,z))continue;
+            if(!traffic_edge_supported(scene,xy[at*2],xy[at*2+1],dx,dy,z,pass==1))continue;
+            if(!traffic_edge_clear(roads,world,car,at,nb,z))continue;
+            /* Bounded recursive preview follows open junction alternatives,
+               rather than rejecting the approach to a junction merely because
+               a later authored branch is closed. Terminal/reverse chains keep
+               their existing endpoint behavior. */
+            if(preview>0 && scene && roads->next[nb]>=0 && roads->next[nb]!=at) {
+                float nz=z;world_ground_at(scene,xy[nb*2],xy[nb*2+1],z,&nz);
+                if(traffic_next(roads,world,car,nb,at,nz,preview-1)<0)continue;
+            }
             float s=previous<0? -gap : (dx*hx+dy*hy)/len-gap*0.02f;
             if(s>score){score=s;best=nb;}
         }
       }
     }
     return best; /* no authored continuation: despawn off-screen instead of a U-turn */
-}
-
-int ai_road_next(const AiRoadNet *roads,N2Scene *scene,int at,int previous,float z) {
-    return traffic_next(roads,scene,at,previous,z);
 }
 
 static float traffic_corner_trim(const AiRoadNet *roads,int before,int corner,int after) {
@@ -548,6 +603,11 @@ static float traffic_corner_trim(const AiRoadNet *roads,int before,int corner,in
     if(cosine>0.995f || cosine<-0.85f)return 0;
     float width=roads->half_width?roads->half_width[corner]:6.0f;
     return fminf(fminf(8.0f,fminf(al,bl)*0.35f),fmaxf(2.0f,width*0.9f));
+}
+
+int ai_road_next(const AiRoadNet *roads,const AiTrafficWorld *world,const AiCar *car,
+                 int at,int previous,float z) {
+    return traffic_next(roads,world,car,at,previous,z,3);
 }
 
 static void traffic_path_pose(const AiRoadNet *roads,const AiTraffic *route,
@@ -598,7 +658,7 @@ static int traffic_spawn_run_clear(const AiRoadNet *roads,const AiTrafficWorld *
                                    const AiCar *car,int from,int to,float z) {
     if(!world || !world->scene)return 1;
     AiTraffic route={.prev=-1,.from=from,.to=to,
-                     .after=traffic_next(roads,world->scene,to,from,z)};
+                     .after=ai_road_next(roads,world,car,to,from,z)};
     for(int i=0;i<15;i++) {
         route.along+=1.0f;
         float length=hypotf(roads->xy[2*route.to]-roads->xy[2*route.from],
@@ -606,7 +666,7 @@ static int traffic_spawn_run_clear(const AiRoadNet *roads,const AiTrafficWorld *
         if(route.along>=length) {
             if(route.after<0)return 0;
             route.along-=length;route.prev=route.from;route.from=route.to;route.to=route.after;
-            route.after=traffic_next(roads,world->scene,route.to,route.from,z);
+            route.after=ai_road_next(roads,world,car,route.to,route.from,z);
             length=hypotf(roads->xy[2*route.to]-roads->xy[2*route.from],
                            roads->xy[2*route.to+1]-roads->xy[2*route.from+1]);
         }
@@ -693,7 +753,7 @@ int ai_traffic_respawn(const AiRoadNet *roads, const AiTrafficWorld *world,
         float dx=roads->xy[next*2]-x,dy=roads->xy[next*2+1]-y;
         float len=hypotf(dx,dy);
         if(len<1.0f || len>60.0f ||
-           !traffic_edge_supported(scene,x,y,dx,dy,z))continue;
+           !traffic_edge_supported(scene,x,y,dx,dy,z,1))continue;
         if(pass==0 && (fabsf(px*fy-py*fx)<20.0f ||
            fabsf((dx*fx+dy*fy)/len)>0.85f))continue;
         float run=0;int at=i;
@@ -728,7 +788,7 @@ int ai_traffic_respawn(const AiRoadNet *roads, const AiTrafficWorld *world,
     AiCar *car=&cars[k];
     float dx=roads->xy[to*2]-roads->xy[best*2];
     float dy=roads->xy[to*2+1]-roads->xy[best*2+1];
-    routes[k].after=traffic_next(roads,scene,to,best,bz);
+    routes[k].after=ai_road_next(roads,world,car,to,best,bz);
     routes[k].lane_offset=traffic_lane_tangent(roads,scene,best,to,0,
         roads->xy[best*2],roads->xy[best*2+1],bz,
         atan2f(dy,dx),
@@ -811,14 +871,29 @@ void ai_traffic_step(AiCar *car, AiTraffic *route, const AiRoadNet *roads,
         traffic_lane_tangent(roads,scene,from,to,1,x,y,z,h,&x,&y,&z);
         if((car->pos[0]-x)*cosf(h)+(car->pos[1]-y)*sinf(h)<0)break;
         route->prev=from;route->from=to;route->to=route->after;
-        route->after=traffic_next(roads,scene,route->to,route->from,car->pos[2]);
+        route->after=ai_road_next(roads,world,car,route->to,route->from,car->pos[2]);
+    }
+    const N2Mesh *owner=scene?scene->meshes:NULL;
+    float body[3]={car->half_length,car->half_width,car->height};
+    if(route->preview_scene!=owner || memcmp(route->preview_body,body,sizeof body)) {
+        route->preview_valid=0;route->preview_scene=owner;
+        memcpy(route->preview_body,body,sizeof body);
     }
     AiTraffic target=*route;
     target.along+=fminf(10.0f,4.0f+fabsf(car->spd)*PHYS_TICKRATE*.35f);
     for(int hop=0;hop<8 && target.along>length;hop++) {
         if(target.after<0){target.along=length;break;}
         target.along-=length;target.prev=target.from;target.from=target.to;target.to=target.after;
-        target.after=traffic_next(roads,scene,target.to,target.from,car->pos[2]);
+        float pz=car->pos[2];
+        if(scene)world_ground_at(scene,xy[2*target.to],xy[2*target.to+1],pz,&pz);
+        unsigned bit=1u<<hop;
+        if(!(route->preview_valid&bit) || route->preview_from[hop]!=target.from ||
+           route->preview_to[hop]!=target.to || route->preview_z[hop]!=pz) {
+            route->preview_after[hop]=ai_road_next(roads,world,car,target.to,target.from,pz);
+            route->preview_from[hop]=target.from;route->preview_to[hop]=target.to;
+            route->preview_z[hop]=pz;route->preview_valid|=bit;
+        }
+        target.after=route->preview_after[hop];
         length=hypotf(xy[2*target.to]-xy[2*target.from],xy[2*target.to+1]-xy[2*target.from+1]);
     }
     float x,y,h,z=car->pos[2];

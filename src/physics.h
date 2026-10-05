@@ -161,6 +161,7 @@ typedef struct {
     int   valid[4];  /* 1 = reachable support this frame          */
     float ax[4], ay[4];
     float vz[4];     /* support-height rate along wheel XY motion, m/s; 0 at rest */
+    float pitch_limit, roll_limit; /* absolute gradients of reachable ground faces */
 } PhysRideSupport;
 
 /* Static equilibrium on the given support. Solves heave, pitch and roll from

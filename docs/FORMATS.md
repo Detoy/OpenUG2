@@ -1051,8 +1051,9 @@ indices must match source order. The returned record offset provides provenance.
 Across all 46 local records, inertia matches the solid-box relation
 `Ixx = mass*(W²+H²)/12` and cyclic permutations. These physical dimensions are
 not render bounding boxes: fourteen traffic records share generic mass/body
-values. The BUS source axle is reportable here but still exceeds the existing
-live axle reader's bounds and therefore retains its geometry fallback.
+values. The live axle reader validates mirrored wheel pairs and allows source
+body dimensions to extend its passenger-car bounds; BUS therefore uses its
+authored axle/track positions instead of geometry fractions.
 
 `--vehicle-compare A B` and `--fleet-census` print the source record offset,
 mass, dimensions, inertia and all four tyre sizes alongside existing results.

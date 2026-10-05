@@ -38,8 +38,6 @@ typedef struct {
     float gx0, gy0;
 } AiRoadNet;
 int ai_roads_index(AiRoadNet *roads);
-/* Next authored/junction node after `at` coming from `previous` (-1: none). */
-int ai_road_next(const AiRoadNet *roads, N2Scene *scene, int at, int previous, float z);
 int ai_roads_load(AiRoadNet *roads, const char *tracks_root);
 void ai_roads_free(AiRoadNet *roads);
 
@@ -51,6 +49,11 @@ typedef struct {
     unsigned respawns, wait_ticks;
     float lane_offset, max_impact;
     unsigned air_ticks;
+    /* Driver preview is stable within one immutable resident and body size. */
+    const N2Mesh *preview_scene;
+    float preview_body[3], preview_z[8];
+    int preview_from[8], preview_to[8], preview_after[8];
+    unsigned preview_valid;
 } AiTraffic;
 typedef struct {
     N2Scene *scene;
@@ -60,6 +63,9 @@ typedef struct {
     float eye[3], view[2];
     int traffic_target; /* 0..N_TRAFFIC_MAX, roaming racers are independent */
 } AiTrafficWorld;
+/* Next supported, collision-clear node; NULL car uses the default body size. */
+int ai_road_next(const AiRoadNet *roads,const AiTrafficWorld *world,const AiCar *car,
+                 int at,int previous,float z);
 /* Optional read-only observer for behaviour audits; NULL in production. Called
  * once per free-roam simulation tick after contacts and population update. */
 typedef void (*AiAuditHook)(const AiCar cars[N_OPENWORLD_AI],
@@ -67,6 +73,10 @@ typedef void (*AiAuditHook)(const AiCar cars[N_OPENWORLD_AI],
                             const AiRoadNet *roads, const AiTrafficWorld *world,
                             const AiCar *player, long tick);
 extern AiAuditHook g_ai_audit_hook;
+/* Optional observer of actual position corrections; never changes the solver.
+ * kind 0: world walls/rails, kind 1: vehicle separation. */
+typedef void (*AiContactHook)(const float before[3],const float after[3],int kind);
+extern AiContactHook g_ai_contact_hook;
 /* Work counters for the optional frame profiler; the caller resets them. */
 typedef struct { long passes, pairs, hits, world_fixes, wall_candidates; } AiPerf;
 extern AiPerf g_ai_perf;

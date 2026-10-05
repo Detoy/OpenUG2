@@ -37,6 +37,85 @@ extern "C" void dbgui_event(const union SDL_Event *e) {
 extern "C" int dbgui_want_mouse(void)    { return ImGui::GetIO().WantCaptureMouse; }
 extern "C" int dbgui_want_keyboard(void) { return ImGui::GetIO().WantCaptureKeyboard; }
 
+static ImU32 heat_colour(float value) {
+    value=fmaxf(0,fminf(1,value));
+    float r,g,b;ImGui::ColorConvertHSVtoRGB((1-value)*.66f,.9f,1,r,g,b);
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(r,g,b,.95f));
+}
+static void heatmap_controls() {
+    ImGui::SeparatorText("Traffic / collision heatmap");
+    ImGui::Checkbox("Record diagnostics",(bool *)&g_dbg.heat_record);
+    ImGui::SameLine();if(ImGui::Button("Clear heatmap"))g_dbg.heat_clear=1;
+    ImGui::Combo("Layer",&g_dbg.heat_layer,
+        "Off\0Current occupancy\0Stationary vehicles\0World corrections\0Vehicle corrections\0");
+    if(!g_dbg.heat_layer)return;
+    ImGui::Checkbox("Follow player",(bool *)&g_dbg.heat_local);
+    ImGui::SameLine();ImGui::Checkbox("Near player height (+/-4 m)",(bool *)&g_dbg.heat_height);
+    if(g_dbg.heat_local)ImGui::SliderFloat("Map width",&g_dbg.heat_span,100,1500,"%.0f m");
+    ImGui::Checkbox("Include racers in traffic layers",(bool *)&g_dbg.heat_racers);
+    ImGui::TextDisabled("%s | %.1f s collected | 4 Hz traffic snapshots",
+        g_dbg.heat_record?"Recording":"Paused",g_dbg.heatmap.seconds);
+    if(g_dbg.heat_layer==1)ImGui::TextWrapped("Blue: 1 vehicle; red: 4+ per directed segment. Hover for speed and count.");
+    else if(g_dbg.heat_layer==2)ImGui::TextWrapped("Red: all vehicles stationary for 3+ seconds. Queues can be legitimate; this is not proof of stuck AI.");
+    else ImGui::TextWrapped("Blue to red: correction distance, relative to the hottest bin. 10 s decay; expires after 60 s. Points mark vehicle positions in 8 m bins, not exact surface contacts.");
+    if(g_dbg.heatmap.evictions)ImGui::TextDisabled("Oldest correction bins replaced: %u (capacity %d)",g_dbg.heatmap.evictions,HEAT_CONTACTS);
+}
+static void draw_heatmap(ImDrawList *dl,ImVec2 p0,float side,float x0,float y0,float span) {
+    const TrafficHeatmap &h=g_dbg.heatmap;
+    const auto map=[&](float x,float y){return ImVec2(p0.x+(x-x0)*side/span,p0.y+side-(y-y0)*side/span);};
+    ImVec2 mouse=ImGui::GetIO().MousePos;
+    bool inside=mouse.x>=p0.x && mouse.x<=p0.x+side && mouse.y>=p0.y && mouse.y<=p0.y+side;
+    int hover=-1;float nearest=64;
+    if(g_dbg.heat_layer<=2) {
+        for(int i=0;i<h.nroads;i++) {
+            const HeatRoad &r=h.roads[i];
+            if((r.racer && !g_dbg.heat_racers) || (g_dbg.heat_height && fabsf(r.z-g_dbg.car[2])>4))continue;
+            ImVec2 a=map(r.a[0],r.a[1]),b=map(r.b[0],r.b[1]);
+            float dx=b.x-a.x,dy=b.y-a.y,length=sqrtf(dx*dx+dy*dy);
+            if(length>1) { // offset opposite directions to opposite sides of the road
+                float ox=-dy/length*3,oy=dx/length*3;a.x+=ox;b.x+=ox;a.y+=oy;b.y+=oy;
+            }
+            float value=g_dbg.heat_layer==1?(r.count-1)/3.0f:(float)r.stationary/r.count;
+            ImU32 color=heat_colour(value);
+            if(length>1) {
+                dl->AddLine(a,b,color,4);
+                ImVec2 mid((a.x+b.x)*.5f,(a.y+b.y)*.5f);
+                float ux=dx/length,uy=dy/length;
+                dl->AddTriangleFilled(ImVec2(mid.x+ux*5,mid.y+uy*5),
+                    ImVec2(mid.x-ux*4-uy*4,mid.y-uy*4+ux*4),
+                    ImVec2(mid.x-ux*4+uy*4,mid.y-uy*4-ux*4),color);
+            } else dl->AddCircleFilled(a,5,color);
+            float t=length>1?fmaxf(0,fminf(1,((mouse.x-a.x)*dx+(mouse.y-a.y)*dy)/(length*length))):0;
+            float ex=mouse.x-a.x-t*dx,ey=mouse.y-a.y-t*dy,d2=ex*ex+ey*ey;
+            if(d2<nearest){nearest=d2;hover=i;}
+        }
+        if(inside && hover>=0) {
+            const HeatRoad &r=h.roads[hover];
+            ImGui::SetTooltip("%s | edge %d -> %d | Z %.1f m\n%d vehicles, %d stationary >=3 s\nMean speed %.1f km/h",
+                r.racer?"Racers":"Traffic",r.from,r.to,r.z,r.count,r.stationary,r.speed*3.6f);
+        }
+    } else {
+        int kind=g_dbg.heat_layer==3?HEAT_WORLD:HEAT_VEHICLE;float peak=.0001f;
+        for(int i=0;i<HEAT_CONTACTS;i++) {
+            const HeatContact &c=h.contacts[i];
+            if(c.used && c.kind==kind && (!g_dbg.heat_height || fabsf(c.pos[2]-g_dbg.car[2])<=4))peak=fmaxf(peak,c.heat);
+        }
+        for(int i=0;i<HEAT_CONTACTS;i++) {
+            const HeatContact &c=h.contacts[i];
+            if(!c.used || c.kind!=kind || (g_dbg.heat_height && fabsf(c.pos[2]-g_dbg.car[2])>4))continue;
+            ImVec2 p=map(c.pos[0],c.pos[1]);float value=sqrtf(c.heat/peak);
+            dl->AddCircleFilled(p,4+5*value,heat_colour(value));
+            float dx=mouse.x-p.x,dy=mouse.y-p.y,d2=dx*dx+dy*dy;
+            if(d2<nearest){nearest=d2;hover=i;}
+        }
+        if(inside && hover>=0) {
+            const HeatContact &c=h.contacts[hover];
+            ImGui::SetTooltip("Vehicle position %.1f, %.1f, %.1f\n%u solver corrections (not crashes)\nDecayed distance %.3f m; peak single correction %.3f m\nLast seen %.1f s ago",
+                c.pos[0],c.pos[1],c.pos[2],c.corrections,c.heat,c.peak,h.seconds-c.last);
+        }
+    }
+}
+
 static bool shop_tab(const char *label, ImVec4 colour) {
     ImGui::PushStyleColor(ImGuiCol_Text, colour);
     bool open=ImGui::BeginTabItem(label);
@@ -239,6 +318,7 @@ extern "C" void dbgui_frame(void) {
         if (ImGui::CollapsingHeader("Body paint", ImGuiTreeNodeFlags_DefaultOpen)) {
             const char *quality[] = { "Low", "Medium", "High" };
             ImGui::Combo("Vehicle detail", &g_dbg.vehicle_quality, quality, 3);
+            ImGui::TextDisabled("Low: square shadow. Medium/High: mesh shadows and local city reflections.");
             ImGui::TextDisabled("Controls paint, clear coat and glass reflections for every car.");
             /* body paint -> u_PaintColor (uColor) when override is on; the draw
                loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
@@ -249,6 +329,9 @@ extern "C" void dbgui_frame(void) {
             if (ImGui::Button("Black"))  { g_dbg.paint_override=1; g_dbg.paint[0]=0.02f; g_dbg.paint[1]=0.02f; g_dbg.paint[2]=0.03f; } ImGui::SameLine();
             if (ImGui::Button("Silver")) { g_dbg.paint_override=1; g_dbg.paint[0]=0.60f; g_dbg.paint[1]=0.62f; g_dbg.paint[2]=0.66f; }
             ImGui::SliderFloat("Clear coat", &g_dbg.body_clearcoat, 0.0f, 1.0f);
+            bool shine=g_dbg.paint_shine!=0;
+            if(ImGui::Checkbox("Streetlight paint shine",&shine))g_dbg.paint_shine=shine;
+            ImGui::TextDisabled("Shine follows nearby lights; Low vehicle detail disables it.");
             ImGui::SliderFloat("Paint highlight", &g_dbg.body_spec, 0.05f, 1.0f);
             ImGui::SliderFloat("Paint reflection", &g_dbg.body_env, 0.0f, 2.0f, "%.2fx");
         }
@@ -383,6 +466,23 @@ extern "C" void dbgui_frame(void) {
             ImGui::SameLine();
             ImGui::TextDisabled(g_dbg.night_mode ? "(lenses glow, headlights on)"
                                                  : "(daylight, lenses off)");
+        }
+        if (ImGui::CollapsingHeader("Rain & wet roads", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if(ImGui::Button("Dry")){g_dbg.rain_intensity=0;g_dbg.road_wetness=0;}
+            ImGui::SameLine();
+            if(ImGui::Button("After rain")){g_dbg.rain_intensity=0;g_dbg.road_wetness=0.85f;}
+            ImGui::SameLine();
+            if(ImGui::Button("Rain")){g_dbg.rain_intensity=0.7f;g_dbg.road_wetness=1;}
+            ImGui::TextDisabled("Screen droplets; no world-space rain particles.");
+            ImGui::SliderFloat("Rain intensity", &g_dbg.rain_intensity, 0, 1);
+            ImGui::SliderFloat("Road wetness", &g_dbg.road_wetness, 0, 1);
+            ImGui::Combo("Weather detail", &g_dbg.weather_quality, "Low\0Medium\0High\0");
+            bool reflections=g_dbg.road_reflections!=0;
+            if(ImGui::Checkbox("Road scene reflections (expensive)",&reflections))g_dbg.road_reflections=reflections;
+            if(ImGui::IsItemHovered())ImGui::SetTooltip("Reflects objects visible on screen. Low detail keeps surface highlights only.");
+            if(g_dbg.road_reflection_draws<0)ImGui::TextDisabled("Scene reflections unavailable; using surface highlights.");
+            else ImGui::TextDisabled("Visible-scene reflections: %d road draws (Medium/High)",g_dbg.road_reflection_draws);
+            ImGui::TextWrapped("Visual preview: wetness stays at the selected value; driving grip is unchanged.");
         }
         if (ImGui::CollapsingHeader("Headlights", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Combo("Beam preview", &g_dbg.headlight_mode, "Low beam\0High beam\0Off\0");
@@ -598,13 +698,14 @@ extern "C" void dbgui_frame(void) {
         ImGui::Text("car XYZ     %.1f  %.1f  %.1f", g_dbg.car[0], g_dbg.car[1], g_dbg.car[2]);
         ImGui::Text("heading %.2f rad   %.0f km/h", g_dbg.heading, g_dbg.kmh);
         ImGui::Separator();
-        ImGui::Checkbox("Orbit camera (F)", (bool *)&g_dbg.freecam);
-        ImGui::TextWrapped("Hold right mouse and drag to look around the car.");
+        ImGui::Checkbox("Free camera (F)", (bool *)&g_dbg.freecam);
+        ImGui::TextWrapped("Right mouse: orbit the car. F: free camera, WASD move, Q/E down/up, Shift faster.");
         ImGui::EndTabItem();
     }
 
     /* ---- Tab 5: Navigation & Races ---- */
     if (ImGui::BeginTabItem("Navigation & Races")) {
+    heatmap_controls();
     /* The real drivable road network parsed
        from the per-region ROUTES path files (chunk 0x34148), drawn top-down
        in world XY. Independent of the 3D geometry viewer. ---- */
@@ -616,12 +717,16 @@ extern "C" void dbgui_frame(void) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
         float side = avail.x < avail.y ? avail.x : avail.y;
         if (side < 80.0f) side = 80.0f;
-        if (side > 300.0f) side = 300.0f;   /* leave room for the track manager below */
+        if (side > (g_dbg.heat_layer?450.0f:300.0f)) side = g_dbg.heat_layer?450.0f:300.0f;   /* leave room for the track manager below */
         ImDrawList *dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, ImVec2(p0.x+side, p0.y+side), IM_COL32(12,14,20,255));
         float x0=g_dbg.navbb[0], x1=g_dbg.navbb[1], y0=g_dbg.navbb[2], y1=g_dbg.navbb[3];
         float w = x1-x0, h = y1-y0, span = w > h ? w : h;
         if (span < 1.0f) span = 1.0f;
+        if(g_dbg.heat_layer && g_dbg.heat_local) {
+            span=fmaxf(100,g_dbg.heat_span);x0=g_dbg.car[0]-span*.5f;y0=g_dbg.car[1]-span*.5f;
+        }
+        dl->PushClipRect(p0,ImVec2(p0.x+side,p0.y+side),true);
         /* world -> screen; world +Y is north, screen +Y is down, so flip Y */
         #define MAPX(X) (p0.x + ((X)-x0)/span*side)
         #define MAPY(Y) (p0.y + side - ((Y)-y0)/span*side)
@@ -648,6 +753,7 @@ extern "C" void dbgui_frame(void) {
             if (!cont) {
                 if (nchain > 1)
                     dl->AddPolyline(chain, nchain,
+                                    g_dbg.heat_layer?IM_COL32(65,70,80,160):
                                     curd >= 0 ? DC[curd & 7] : IM_COL32(130,130,130,160),
                                     0, 1.0f);
                 nchain = 0;
@@ -714,12 +820,14 @@ extern "C" void dbgui_frame(void) {
                 g_dbg.gps_request = 1;
             }
         }
+        if(g_dbg.heat_layer)draw_heatmap(dl,p0,side,x0,y0,span);
         /* player */
         float px = MAPX(g_dbg.car[0]), py = MAPY(g_dbg.car[1]);
         dl->AddCircleFilled(ImVec2(px, py), 4.0f, IM_COL32(255,80,60,255));
         float hx = px + cosf(g_dbg.heading)*11.0f;
         float hy = py - sinf(g_dbg.heading)*11.0f;   /* Y flipped */
         dl->AddLine(ImVec2(px,py), ImVec2(hx,hy), IM_COL32(255,220,90,255), 2.0f);
+        dl->PopClipRect();
         ImGui::Dummy(ImVec2(side, side));
         for (int i = 0; i < g_dbg.ndist && i < 8; i++) {
             if (i) ImGui::SameLine();

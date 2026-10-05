@@ -4,6 +4,11 @@
 #include "physics.h"
 #include "world.h"
 #include <assert.h>
+#include "traffic_heatmap.h"
+static TrafficHeatmap test_heat;
+static void test_heat_contact(const float a[3],const float b[3],int kind) {
+    heatmap_contact(&test_heat,a,b,kind);
+}
 
 static void traffic_pileup(int count,float angle,int order,int heavy,int backed,float gap) {
     float floor[]={-100,-100,0,0,0,100,-100,0,0,0,100,100,0,0,0,-100,100,0,0,0};
@@ -91,8 +96,19 @@ static void traffic_impact_at_wall(float angle,float mass,int rail) {
             .ax={1,1,-1,-1},.ay={.8f,-.8f,.8f,-.8f}};
         phys_ride_init(&c->ride,&c->support);c->ride_ready=1;
     }
+    AiCar initial_a=a,initial_b=b;
     AiCar *contacts[]={&a,&b};
-    assert(ai_car_contacts(contacts,2,&world,&a)>0);
+    float baseline_hit=ai_car_contacts(contacts,2,&world,&a);assert(baseline_hit>0);
+    AiCar expected_a=a,expected_b=b;
+    a=initial_a;b=initial_b;heatmap_clear(&test_heat);g_ai_contact_hook=test_heat_contact;
+    float observed_hit=ai_car_contacts(contacts,2,&world,&a);g_ai_contact_hook=NULL;
+    assert(observed_hit==baseline_hit && !memcmp(&a,&expected_a,sizeof a) &&
+           !memcmp(&b,&expected_b,sizeof b));
+    int world_hits=0,car_hits=0;
+    for(int i=0;i<HEAT_CONTACTS;i++)if(test_heat.contacts[i].used) {
+        if(test_heat.contacts[i].kind==HEAT_WORLD)world_hits++;else car_hits++;
+    }
+    assert(world_hits && car_hits); /* observer sees both production paths */
     float front=b.pos[0]*co+b.pos[1]*sn+2;
     printf("impact at %s: angle %.2f mass %.1f front %.5f (wall 5.5)\n",rail?"rail":"wall",angle,mass,front);
     fflush(stdout);
@@ -275,7 +291,134 @@ static void traffic_density_test(void) {
     puts("traffic density: default/increase/zero/decrease/restore, safe visibility, racer roles and retry fairness PASS");
 }
 
+static void traffic_authored_terrain(void) {
+    float verts[3][20];uint16_t idx[]={0,1,2,0,2,3};
+    const float ends[]={-150,-40,40,150};N2Mesh meshes[3]={0};
+    for(int m=0;m<3;m++) {
+        float quad[]={ends[m],-6,0,0,0,ends[m+1],-6,0,0,0,
+                      ends[m+1],6,0,0,0,ends[m],6,0,0,0};
+        memcpy(verts[m],quad,sizeof quad);
+        meshes[m]=(N2Mesh){.verts=verts[m],.nverts=4,.idx=idx,.nidx=6,
+                            .cat=m==1?N2_TERRAIN:N2_ROAD};
+    }
+    N2Scene scene={meshes,3,3};AiTrafficWorld world={.scene=&scene};
+    float xy[]={-90,0,-60,0,-30,0,0,0,30,0,60,0,90,0,-30,0,0,0};
+    int next[]={1,2,3,4,5,6,-1,8,-1};
+    AiRoadNet roads={.xy=xy,.next=next,.n=9};
+    for(int indexed=0;indexed<2;indexed++) {
+        if(indexed)assert(ai_roads_index(&roads));
+        assert(ai_road_next(&roads,&world,NULL,1,0,0)==2); /* road -> terrain */
+        assert(ai_road_next(&roads,&world,NULL,2,1,0)==3); /* terrain -> terrain */
+        assert(ai_road_next(&roads,&world,NULL,4,3,0)==5); /* terrain -> road */
+        assert(ai_road_next(&roads,&world,NULL,4,5,0)==3); /* reverse traversal */
+    }
+    free(roads.pred_start);free(roads.pred_list);free(roads.cell_start);free(roads.cell_list);
+    roads=(AiRoadNet){.xy=xy,.next=next,.n=9};
+    next[2]=-1;
+    assert(ai_road_next(&roads,&world,NULL,2,1,0)==-1); /* no terrain junction hop */
+    next[2]=3;next[1]=-1;xy[14]=-60;
+    assert(ai_road_next(&roads,&world,NULL,1,0,0)==-1); /* road hop cannot cross terrain */
+    next[1]=2;xy[14]=-30;
+    meshes[1].cat=N2_OTHER;
+    assert(ai_road_next(&roads,&world,NULL,1,0,0)==-1); /* unsupported gap */
+    meshes[1].cat=N2_TERRAIN;
+    for(int v=0;v<4;v++)verts[1][v*5+2]=6;
+    assert(ai_road_next(&roads,&world,NULL,1,0,0)==-1); /* different height layer */
+    for(int v=0;v<4;v++)verts[1][v*5+2]=0;
+    AiCar car={.pos={-60,-1.8f,0},.spd=.12f,.target_speed=.12f,
+        .half_length=2,.half_width=.9f,.height=1.5f,
+        .support={.ax={1,1,-1,-1},.ay={.8f,-.8f,.8f,-.8f}}};
+    AiTraffic route={.prev=-1,.from=0,.to=1,.after=2,.present=1};
+    for(int tick=0;tick<1200;tick++) {
+        ai_traffic_step(&car,&route,&roads,&world);
+        assert(route.to>=0 && route.stop_reason==0);
+        assert(fabsf(car.pos[1]+1.8f)<.05f && fabsf(route.lane_offset-1.8f)<.001f);
+    }
+    assert(car.pos[0]>45); /* drove through the whole terrain strip in-lane */
+    /* A narrow ROAD strip with a TERRAIN shoulder must retain its old
+       centre fallback, rather than treating the shoulder as a traffic lane. */
+    scene.count=2;
+    for(int v=0;v<4;v++) {
+        verts[0][v*5]=verts[1][v*5]=(v==1 || v==2)?150:-150;
+        verts[0][v*5+1]=v<2?-.2f:.2f;
+        verts[1][v*5+1]=v<2?-6:6;
+    }
+    car=(AiCar){.pos={-60,0,0},.spd=.12f,.target_speed=.12f};
+    route=(AiTraffic){.prev=-1,.from=0,.to=1,.after=2,.present=1};
+    ai_traffic_step(&car,&route,&roads,&world);
+    assert(route.lane_offset==0);
+    AiCar cars[N_OPENWORLD_AI]={0};AiTraffic routes[N_OPENWORLD_AI]={0};
+    meshes[0].cat=meshes[2].cat=N2_TERRAIN;
+    assert(!ai_traffic_respawn(&roads,&world,cars,routes,0,(float[3]){200,0,0},0));
+    puts("authored terrain: continuation, lanes, gaps, layers and strict spawn/junction gates PASS");
+}
+
+static void traffic_closed_road(void) {
+    float floor[]={-100,-100,0,0,0,100,-100,0,0,0,100,100,0,0,0,-100,100,0,0,0};
+    float wall[]={12,-5,0,0,0,12,5,0,0,0,12,5,3,0,0,12,-5,3,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh m[]={{.verts=floor,.nverts=4,.idx=idx,.nidx=6,.cat=N2_ROAD},
+                {.verts=wall,.nverts=4,.idx=idx,.nidx=6,.cat=N2_OTHER,.scen=N2_SC_WALL}};
+    N2Scene scene={m,2,2};float ob[2][4],oz[2][2];int src[2];
+    AiTrafficWorld w={.scene=&scene,.obst=ob,.obstz=oz,.obstsrc=src};
+    w.nobst=phys_collect_walls(&scene,ob,src,oz,2);
+    float xy[]={-10,0,0,0,20,0,0,0,0,20};int next[]={1,2,-1,4,-1};
+    AiRoadNet roads={.xy=xy,.next=next,.n=5};
+    AiCar small={.half_length=2,.half_width=.9f,.height=1.5f},bus=small;bus.half_length=8;
+    assert(ai_road_next(&roads,&w,&small,1,0,0)==4); /* turn before closure */
+    w.nobst=0;assert(ai_road_next(&roads,&w,&small,1,0,0)==2);
+    /* A closure beyond the centreline endpoint still catches a large body. */
+    for(int i=0;i<4;i++)wall[i*5]=22.5f;
+    w.nobst=phys_collect_walls(&scene,ob,src,oz,2);
+    assert(ai_road_next(&roads,&w,&small,1,0,0)==2);
+    assert(ai_road_next(&roads,&w,&bus,1,0,0)==4);
+    for(int i=0;i<4;i++)wall[i*5+2]+=10;
+    w.nobst=phys_collect_walls(&scene,ob,src,oz,2);
+    assert(ai_road_next(&roads,&w,&bus,1,0,0)==2); /* upper layer is not this road */
+    /* A short blocked spur must be rejected at the upstream junction too. */
+    for(int i=0;i<4;i++){wall[i*5]=12;wall[i*5+2]-=10;}
+    w.nobst=phys_collect_walls(&scene,ob,src,oz,2);
+    float spur[]={-10,0,0,0,6,0,9,0,14,0,0,0,0,20};
+    int links[]={1,2,3,4,-1,6,-1};roads.xy=spur;roads.next=links;roads.n=7;
+    assert(ai_road_next(&roads,&w,&small,1,0,0)==6);
+    /* Real road graphs use indexed candidate lists, including recursive calls. */
+    roads.xy=malloc(sizeof spur);memcpy(roads.xy,spur,sizeof spur);
+    roads.next=malloc(sizeof links);memcpy(roads.next,links,sizeof links);
+    assert(ai_roads_index(&roads));
+    assert(ai_road_next(&roads,&w,&small,1,0,0)==6);
+    ai_roads_free(&roads);
+    puts("traffic closed road: direct/preview/size/layer checks PASS");
+}
+
+static void traffic_preview_cache(void) {
+    float v[]={-100,-100,0,0,0,100,-100,0,0,0,100,100,0,0,0,-100,100,0,0,0};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh mesh={.verts=v,.idx=idx,.nverts=4,.nidx=6,.cat=N2_ROAD},next_mesh=mesh;
+    N2Scene scene={&mesh,1,1};AiTrafficWorld w={.scene=&scene};
+    float xy[20];int links[10];
+    for(int i=0;i<10;i++){xy[2*i]=i*4;xy[2*i+1]=0;links[i]=i<9?i+1:-1;}
+    AiRoadNet roads={.xy=xy,.next=links,.n=10};
+    AiCar cached={.pos={0,-1.8f,0},.spd=.08f,.target_speed=.08f,
+                 .half_length=2,.half_width=.9f,.height=1.5f},direct=cached;
+    AiTraffic a={.prev=-1,.from=0,.to=1,.after=2,.present=1},b=a;
+    int populated=0;
+    for(int f=0;f<240;f++) {
+        if(f==60)scene.meshes=&next_mesh; /* new immutable resident */
+        if(f==120){cached.half_length=direct.half_length=3;cached.half_width=direct.half_width=1.2f;}
+        b.preview_valid=0;
+        ai_traffic_step(&cached,&a,&roads,&w);ai_traffic_step(&direct,&b,&roads,&w);
+        populated|=a.preview_valid!=0;
+        assert(!memcmp(&cached,&direct,sizeof cached));
+        assert(a.from==b.from && a.to==b.to && a.after==b.after && a.travelled==b.travelled);
+    }
+    assert(populated);
+    puts("traffic preview cache: exact driving, resident/body invalidation PASS");
+}
+
 int main(void) {
+    traffic_preview_cache();
+    traffic_closed_road();
+    traffic_authored_terrain();
     traffic_density_test();
     phys_selftest();
     for(int count=3;count<=N_OPENWORLD_AI+1;count+=4)
@@ -578,8 +721,8 @@ int main(void) {
         for (int at = 0; at < RN; at++)
             for (int pv = -1; pv < 2; pv++) {
                 int previous = pv < 0 ? -1 : pv == 0 ? (at%12 ? at-1 : -1) : (at+7)%RN;
-                int a = ai_road_next(&lin, NULL, at, previous, 0);
-                int b = ai_road_next(&idx, NULL, at, previous, 0);
+                int a = ai_road_next(&lin, NULL, NULL, at, previous, 0);
+                int b = ai_road_next(&idx, NULL, NULL, at, previous, 0);
                 assert(a == b); checked++;
                 if (a >= 0 && a != rnext[at]) junction++;
             }

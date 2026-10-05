@@ -5,6 +5,7 @@
 #define _DARWIN_C_SOURCE
 #include "world.h"
 #include "world_resident.h"
+#include "physics.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,6 +199,56 @@ static GLuint test_resident_resource_build(const char *region_path) {
     }
     world_neighborhood_free(&candidate.world);
     return bound;
+}
+
+/* Collision slicing must preserve source order/bounds and keep the candidate
+ * inactive until the last mesh, including the current-position support check. */
+static void test_sliced_collision(void) {
+    enum { N = 35 };
+    WorldResident *r = calloc(1, sizeof *r); assert(r);
+    WorldNeighborhood *w = &r->world;
+    r->radius = w->radius = 1400;
+    w->scene.count = w->scene.cap = N;
+    w->scene.meshes = calloc(N, sizeof *w->scene.meshes);
+    w->mbb = calloc(N, sizeof *w->mbb); assert(w->scene.meshes && w->mbb);
+    for (int i = 0; i < N; i++) {
+        N2Mesh *m = &w->scene.meshes[i];
+        const float verts[15] = {0,0,0,0,0, 4,0,0,1,0, 0,4,0,0,1};
+        m->verts = malloc(sizeof verts); m->idx = malloc(3 * sizeof *m->idx);
+        assert(m->verts && m->idx); memcpy(m->verts, verts, sizeof verts);
+        m->idx[0]=0; m->idx[1]=1; m->idx[2]=2;
+        m->nverts=m->nidx=3; m->cat=N2_ROAD;
+        m->scen = i % 3 ? N2_SC_BUILDING : N2_SC_NONE;
+        w->mbb[i][2]=w->mbb[i][3]=4;
+    }
+    assert(world_ground_grid_build(&w->grid,&w->scene,(const float (*)[4])w->mbb));
+    float bounds[N][4], heights[N][2]; int sources[N];
+    int expected=phys_collect_walls(&w->scene,bounds,sources,heights,N);
+    assert(expected==23);
+    for (int leave=0; leave<3; leave++) {
+        assert(!world_resident_finish_step(r,1,1,0,1,NULL));
+        assert(!world_resident_finish_step(r,1,1,0,1,NULL));
+        assert(r->resources.ordinary && r->resources.collision_mesh==16);
+        assert(!world_resident_finish_step(r,1,1,0,1,NULL));
+        assert(r->resources.collision_mesh==32);
+        if (leave==2) {
+            GLuint buffer=r->resources.ordinary[0].vbo;
+            assert(glIsBuffer(buffer)); world_resident_resources_free(&r->resources);
+            assert(!glIsBuffer(buffer) && !r->resources.obstacles);
+            continue;
+        }
+        assert(world_resident_finish_step(r,leave?1e8f:1,1,0,1,NULL)==(leave?-1:1));
+        assert(r->resources.collision_mesh==N && r->resources.obstacle_count==expected);
+        assert(!memcmp(bounds,r->resources.obstacles,(size_t)expected*sizeof bounds[0]));
+        assert(!memcmp(heights,r->resources.obstacle_z,(size_t)expected*sizeof heights[0]));
+        assert(!memcmp(sources,r->resources.obstacle_src,(size_t)expected*sizeof sources[0]));
+        world_resident_resources_free(&r->resources);
+    }
+    /* INT_MAX synchronous finish uses the identical collector and ownership. */
+    assert(world_resident_resources_build(&r->resources,w,NULL));
+    assert(r->resources.obstacle_count==expected);
+    assert(!memcmp(sources,r->resources.obstacle_src,(size_t)expected*sizeof sources[0]));
+    world_resident_free(r);
 }
 
 static void test_failed_upload_retry(const char *region_path) {
@@ -517,6 +568,7 @@ int main(void) {
     test_noise_rejects_only_mis_decodes();
     test_resident_resource_cleanup();
     test_sliced_batches();
+    test_sliced_collision();
     test_unresolved_batch_needs_every_member();
     test_sliced_u16_limit();
     test_incremental_retirement();

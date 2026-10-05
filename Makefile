@@ -28,7 +28,7 @@ endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c src/hud.c
-HDRS := src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/hud.h
+HDRS := src/traffic_heatmap.h src/asset_chunks.h src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h src/hud.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -69,7 +69,7 @@ build/%.o: $(IMGUI_DIR)/%.cpp
 build/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@mkdir -p build
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c $< -o $@
-build/debugui.o: src/debugui.cpp src/debug.h src/car_config.h
+build/debugui.o: src/debugui.cpp src/debug.h src/car_config.h src/traffic_heatmap.h
 	@mkdir -p build
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c src/debugui.cpp -o $@
 
@@ -126,6 +126,11 @@ ground-motion-test: tools/ground_motion_test.c src/ground_motion.h src/world.c s
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/ground_motion_test.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c -o build/ground_motion_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/ground_motion_test
+
+traffic-heatmap-test: tools/traffic_heatmap_test.c src/traffic_heatmap.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc tools/traffic_heatmap_test.c -o build/traffic_heatmap_test -lm
+	./build/traffic_heatmap_test
 
 ai-drive-test: tools/ai_drive_test.c src/ai.c src/world.c src/resource.c src/world_instance.c src/render.c src/physics.c $(HDRS)
 	@mkdir -p build
@@ -282,3 +287,11 @@ headlight-render-test: tools/headlight_render_test.c src/render.c src/render.h s
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/headlight_render_test.c src/render.c -o build/headlight_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/headlight_render_test
+
+.PHONY: traffic-heatmap-test
+
+weather-render-test: tools/weather_render_test.c src/render.c src/render.h src/nfsu2.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/weather_render_test.c src/render.c -o build/weather_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/weather_render_test
+.PHONY: weather-render-test

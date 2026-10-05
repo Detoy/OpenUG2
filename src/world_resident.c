@@ -182,7 +182,6 @@ static int resident_resources_step(WorldResidentResources *resources,
                                    WResidentBuildTiming *timing) {
     if (!resources || !neighborhood || neighborhood->scene.count <= 0 ||
         !neighborhood->scene.meshes || !neighborhood->mbb) return -1;
-    struct timespec rt0, rt1;
     int mesh_count = neighborhood->scene.count;
     int texture_cap = mesh_count + neighborhood->vista.count +
                       (neighborhood->nlights > 0 ? 1 : 0);
@@ -261,49 +260,60 @@ static int resident_resources_step(WorldResidentResources *resources,
         return 0; /* keep texture/partition work separate from ordinary uploads */
     }
 
-    Uint64 batch_begin = SDL_GetPerformanceCounter();
-    int uploaded = upload_world_batches_step(&resources->upload, max_batches,
-                        &resources->ordinary, &resources->ordinary_count,
-                        resources->mesh_batch);
-    if (uploaded < 0) goto fail;
-    if (!uploaded) {
+    if (!resources->ordinary) {
+        Uint64 batch_begin = SDL_GetPerformanceCounter();
+        int uploaded = upload_world_batches_step(&resources->upload, max_batches,
+                            &resources->ordinary, &resources->ordinary_count,
+                            resources->mesh_batch);
+        if (uploaded < 0) goto fail;
+        if (!uploaded) {
+            resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
+            return 0;
+        }
+        if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
+        if (!resident_vista_batches(resources, neighborhood)) goto fail;
+
+        resources->debug_batches = (WorldMeshBatch *)calloc(
+            (size_t)resources->ordinary_count, sizeof *resources->debug_batches);
+        if (!resources->debug_batches) goto fail;
+        for (int i = 0; i < resources->ordinary_count; i++) {
+            resources->debug_batches[i].vbo = resources->ordinary[i].vbo;
+            resources->debug_batches[i].ibo = resources->ordinary[i].ibo;
+            resources->debug_batches[i].index_count =
+                (uint32_t)resources->ordinary[i].index_count;
+            resources->debug_batches[i].chunk_id = (uint32_t)i;
+        }
         resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
-        return 0;
-    }
-    if (resources->ordinary_count <= 0 || !resources->ordinary) goto fail;
-    if (!resident_vista_batches(resources, neighborhood)) goto fail;
-
-    resources->debug_batches = (WorldMeshBatch *)calloc(
-        (size_t)resources->ordinary_count, sizeof *resources->debug_batches);
-    if (!resources->debug_batches) goto fail;
-    for (int i = 0; i < resources->ordinary_count; i++) {
-        resources->debug_batches[i].vbo = resources->ordinary[i].vbo;
-        resources->debug_batches[i].ibo = resources->ordinary[i].ibo;
-        resources->debug_batches[i].index_count =
-            (uint32_t)resources->ordinary[i].index_count;
-        resources->debug_batches[i].chunk_id = (uint32_t)i;
-    }
-    resources->batch_ticks += SDL_GetPerformanceCounter() - batch_begin;
-    if (timing) {
-        timing->batches_ms = (uint32_t)(resources->batch_ticks * 1000 /
-                                       SDL_GetPerformanceFrequency());
-        clock_gettime(CLOCK_MONOTONIC, &rt0);
+        if (timing) timing->batches_ms = (uint32_t)(resources->batch_ticks * 1000 /
+                                                   SDL_GetPerformanceFrequency());
     }
 
-    int obstacle_cap = mesh_count;
-    resources->obstacles = (float (*)[4])calloc(
-        (size_t)obstacle_cap, sizeof *resources->obstacles);
-    resources->obstacle_z = (float (*)[2])calloc(
-        (size_t)obstacle_cap, sizeof *resources->obstacle_z);
-    resources->obstacle_src = (int *)calloc(
-        (size_t)obstacle_cap, sizeof *resources->obstacle_src);
-    if (!resources->obstacles || !resources->obstacle_z ||
-        !resources->obstacle_src) goto fail;
-    resources->obstacle_count = phys_collect_walls(
-        &neighborhood->scene, resources->obstacles,
-        resources->obstacle_src, resources->obstacle_z, obstacle_cap);
-    if (timing) { clock_gettime(CLOCK_MONOTONIC, &rt1);
-                  timing->collision_ms = wrb_ms(&rt0, &rt1); }
+    if (!resources->obstacles) {
+        resources->obstacles = calloc((size_t)mesh_count, sizeof *resources->obstacles);
+        resources->obstacle_z = calloc((size_t)mesh_count, sizeof *resources->obstacle_z);
+        resources->obstacle_src = calloc((size_t)mesh_count, sizeof *resources->obstacle_src);
+        if (!resources->obstacles || !resources->obstacle_z ||
+            !resources->obstacle_src) goto fail;
+    }
+    /* Use the same collector in source order on bounded mesh slices. The
+     * candidate stays detached until every collision shape is ready.
+     * ponytail: mesh quota; split a single mesh only if it causes a measured hitch. */
+    Uint64 collision_begin = SDL_GetPerformanceCounter();
+    int first = resources->collision_mesh;
+    int remaining = mesh_count - first;
+    int take = max_batches > remaining / 16 ? remaining : max_batches * 16;
+    N2Scene part = neighborhood->scene;
+    part.meshes += first; part.count = take;
+    int count = resources->obstacle_count;
+    int added = phys_collect_walls(&part, resources->obstacles + count,
+        resources->obstacle_src + count, resources->obstacle_z + count, take);
+    for (int i = count; i < count + added; i++) resources->obstacle_src[i] += first;
+    resources->obstacle_count += added;
+    resources->collision_mesh += take;
+    resources->collision_ticks += SDL_GetPerformanceCounter() - collision_begin;
+    if (timing) timing->collision_ms = (uint32_t)(
+        resources->collision_ticks * 1000 / SDL_GetPerformanceFrequency());
+    if (resources->collision_mesh < mesh_count) return 0;
     if (glGetError() != GL_NO_ERROR) goto fail;
     return 1;
 

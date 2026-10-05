@@ -128,6 +128,21 @@ int main(void) {
             for(int i=0;i<4;i++){float value;glGetUniformfv(r.prog,loc[i],&value);assert(value==expected[i]);}
         }
     }
+    /* Traffic INTERIOR is a textured wheel-face quad, not the generated
+       passenger-car backing. Its transparent corners must remain cut out. */
+    unsigned char colors[16];memset(colors,255,sizeof colors);
+    glGenBuffers(1,&q.cbo);glBindBuffer(GL_ARRAY_BUFFER,q.cbo);
+    glBufferData(GL_ARRAY_BUFFER,sizeof colors,colors,GL_STATIC_DRAW);
+    q.car_material=N2_MAT_INTERIOR;
+    glUniform1f(r.uVColor,.25f);
+    glDepthMask(GL_TRUE);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    render_wheel_mesh(&r,&q,tex,N2_DRAW_CUTOUT);
+    unsigned char corner[4],face[4];
+    glReadPixels(4,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,corner);
+    glReadPixels(28,16,1,1,GL_RGBA,GL_UNSIGNED_BYTE,face);
+    assert(corner[0]<5 && corner[2]>245 && face[2]<25);
+    float vcolor;glGetUniformfv(r.prog,r.uVColor,&vcolor);assert(vcolor==.25f);
+    glDeleteBuffers(1,&q.cbo);
     assert(glGetError()==GL_NO_ERROR);
     glDeleteTextures(1,&tex);glDeleteBuffers(1,&q.vbo);glDeleteBuffers(1,&q.nbo);glDeleteBuffers(1,&q.ibo);
     glDeleteProgram(r.prog);SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(w);SDL_Quit();

@@ -194,8 +194,8 @@ static void test_car_switch_archive(const char *root) {
     for(int i=0;i<count;i++) {
         next_handle=1;CarSwitchCandidate candidate={0};
         assert(prepare_car_switch(&candidate,root,cars[i]));
-        if(candidate.texlen==0)traffic++;
-        if(candidate.texlen==0)for(int m=0;m<candidate.scene.count;m++)
+        if(candidate.prelight)traffic++;
+        if(candidate.prelight)for(int m=0;m<candidate.scene.count;m++)
             if(candidate.scene.meshes[m].cat==N2_CAR_GLASS){
                 uint32_t key=candidate.scene.meshes[m].texkey;
                 int bound=0;
@@ -203,6 +203,29 @@ static void test_car_switch_archive(const char *root) {
                 assert(key==0x008a6835u && bound);
                 shared_windows++;
             }
+        if(candidate.prelight) {
+            int skin=0,wheel_skin=0;
+            for(int m=0;m<candidate.scene.count;m++) {
+                N2Mesh *mesh=&candidate.scene.meshes[m];
+                if(mesh->car_material!=0x19e0ecbeu && mesh->cat!=N2_CAR_TIRE)continue;
+                assert(mesh->texkey && mesh->vcol);
+                int bound=0;
+                for(int t=0;t<candidate.ntextures;t++)if(candidate.tex_keys[t]==mesh->texkey)bound=1;
+                assert(bound);
+                if(mesh->cat==N2_CAR_TIRE)wheel_skin++;else skin++;
+            }
+            assert(skin && wheel_skin);
+            BodyKitCandidate rebuilt={0};
+            assert(prepare_body_kit(&rebuilt,candidate.data,candidate.len,
+                candidate.keys,candidate.nkeys,&candidate.config,candidate.texdata,
+                candidate.texlen,&candidate.scene,candidate.tex_keys,candidate.ntextures,root));
+            assert(rebuilt.scene.count==candidate.scene.count && rebuilt.ntextures==0);
+            for(int m=0;m<rebuilt.scene.count;m++) {
+                assert(rebuilt.scene.meshes[m].vcol);
+                assert(rebuilt.scene.meshes[m].texkey==candidate.scene.meshes[m].texkey);
+            }
+            body_kit_release(&rebuilt);
+        }
         int stock=candidate.stock_wheel;
         assert(stock>=0 && stock<candidate.scene.count);
         assert(candidate.scene.meshes[stock].car_mount==N2_MOUNT_WHEEL);

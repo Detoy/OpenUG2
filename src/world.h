@@ -339,13 +339,13 @@ void world_ground_selftest(void);
  * the push itself is unchanged. */
 typedef struct { int mesh, tri; float nz, zlo, zhi, edged; } WRailHit;
 int world_wall_push(const N2Scene *s, float *pos, float r, WRailHit *hit);
-/* Gameplay rail response using the loaded car's oriented body footprint.
+/* Gameplay road/terrain wall response using the car's oriented body footprint.
  * Unlike the legacy circle helper above, this preserves velocity along the
  * contacted face and clips the face to the body's actual height. */
 int world_body_wall_push(const N2Scene *s,float *pos,float vel[2],float heading,
                          const float bb[6],float z0,float z1,WRailHit *hit);
-/* Non-mutating form used when validating a spawn candidate. Returns 1 only
-   when world_wall_push would leave the candidate untouched. */
+/* Non-mutating circle probe for spawn validation, using the same height-clipped
+   road/terrain faces as gameplay, including tall retaining walls. */
 int world_wall_clear_at(const N2Scene *s, float x, float y, float z, float r);
 /* M133 texture-binding census: set before world_bind_textures to report every
  * key that produced no GPU texture, split by cause. Diagnostic only. */
