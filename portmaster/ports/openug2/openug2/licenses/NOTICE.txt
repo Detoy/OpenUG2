@@ -1,0 +1,13 @@
+OpenUG2 port packaging notice
+
+The port ships engine code and binaries only. It contains no game data and no
+Electronic Arts code. Each user supplies their own legally acquired copy of
+Need for Speed Underground 2.
+
+Engine license: MIT. The full text is in the OpenUG2 repository LICENSE file,
+copied to this licenses folder.
+
+Bundled dependency: Dear ImGui (MIT), used only in the developer build and not
+shipped in this port.
+
+The GPTOKEYB and SDL2 licenses are provided by the PortMaster runtime.

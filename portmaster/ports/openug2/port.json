@@ -1,0 +1,33 @@
+{
+  "version": 4,
+  "name": "openug2.zip",
+  "items": [
+    "OpenUG2.sh",
+    "openug2"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "OpenUG2 (NFS Underground 2)",
+    "porter": [
+      "Detoy"
+    ],
+    "desc": "An open-source reimplementation of the Need for Speed: Underground 2 engine. Bring your own copy of the game. Early prototype: world loading, rendering, and racing-line opponents work, and controller gameplay is not implemented yet.",
+    "desc_md": null,
+    "inst": "Prepare openug2/data from your own NFSU2 installation with tools/import_nfsu2_data.py. The port ships no game data.",
+    "inst_md": null,
+    "genres": [
+      "racing"
+    ],
+    "image": null,
+    "rtr": false,
+    "exp": true,
+    "runtime": [],
+    "store": [],
+    "availability": "full",
+    "reqs": [],
+    "arch": [
+      "aarch64"
+    ],
+    "min_glibc": "2.27"
+  }
+}

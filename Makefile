@@ -11,7 +11,7 @@
 # Requires SDL2 (brew install sdl2 · apt install libsdl2-dev) and zlib.
 
 CC      ?= cc
-CFLAGS  ?= -O2 -std=c99 -Wall -Wextra
+CFLAGS  ?= -O2 -std=c99 -Wall -Wextra -D_GNU_SOURCE
 # nfsu2.h is a static-function single-header parser shared by several modules;
 # each module uses only part of it, so silence the per-TU unused copies.
 CFLAGS  += -Wno-unused-function
@@ -268,10 +268,40 @@ ai-drive-cli-test: nfsu2
 	  test $$? -eq 2 || { echo "ai_drive_cli_test: FAIL $$args"; exit 1; }; \
 	done; echo 'ai_drive_cli_test: PASS'
 
-# OpenGL ES 2.0 (embedded/mobile). Cross-compile e.g.:
-#   CC=aarch64-linux-gnu-gcc make gles
+# OpenGL ES 2.0 (embedded/mobile).
+# `make gles` alone swaps only the compiler and reuses the HOST sdl2-config,
+# which is not a valid target build (missing GLES2 headers, wrong-ABI libs).
+#
+# `make gles-aarch64` cross-builds against target libraries. It uses the
+# compiler's own sysroot for libc and a target prefix for SDL2, GLES2 and
+# zlib. Assemble the prefix from the target's own packages:
+#   aarch64-linux-gnu-gcc, TARGET_PREFIX=/path/to/aarch64-prefix
+CROSS            ?= aarch64-linux-gnu-
+TARGET_PREFIX    ?=
+TARGET_MULTIARCH ?= aarch64-linux-gnu
+TARGET_INC  := -I"$(TARGET_PREFIX)/usr/include" \
+               -I"$(TARGET_PREFIX)/usr/include/SDL2" \
+               -I"$(TARGET_PREFIX)/usr/include/$(TARGET_MULTIARCH)"
+TARGET_LIBS := -L"$(TARGET_PREFIX)/usr/lib/$(TARGET_MULTIARCH)" \
+               -lSDL2main -lSDL2 -lGLESv2 -lz -lm -ldl -lpthread
+
+gles-aarch64:
+	@test -n "$(TARGET_PREFIX)" || { \
+	  echo "gles-aarch64: set TARGET_PREFIX to an aarch64 prefix with SDL2, GLES2 and zlib dev files."; \
+	  echo "The host sdl2-config from macOS cannot cross-compile; changing CC alone is insufficient."; \
+	  exit 2; }
+	@test -f "$(TARGET_PREFIX)/usr/include/SDL2/SDL.h" || { \
+	  echo "gles-aarch64: $(TARGET_PREFIX)/usr/include/SDL2/SDL.h not found."; exit 2; }
+	$(CROSS)gcc $(CFLAGS) -DN2_GLES $(TARGET_INC) $(SRC) -o nfsu2-gles-aarch64 \
+	  $(TARGET_LIBS) -Wl,--allow-shlib-undefined
+	file nfsu2-gles-aarch64
+
 gles: $(SRC) $(HDRS) $(GEN)
 	$(CC) $(CFLAGS) -DN2_GLES $(SDL_CFLAGS) $(SRC) -o nfsu2 $(SDL_LIBS) -lGLESv2 -lz -lm
+
+import-test:
+	python3 tools/import_nfsu2_data_test.py
+.PHONY: import-test
 
 run: nfsu2
 	./nfsu2 $(DATA)
@@ -280,7 +310,7 @@ clean:
 	rm -f nfsu2 *.png $(GEN)
 	rm -rf build
 
-.PHONY: run normal menu gles clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
+.PHONY: run normal menu gles gles-aarch64 clean debug world-instance-test world-cli-test car-material-test world-render-test world-resident-test district-collision-test wheel-render-test light-state-test world-texture-test world-group-test world-group-audit ai-drive-test ai-drive-cli-test resolution-cli-test render-resolution-test
 
 .PHONY: headlight-render-test
 headlight-render-test: tools/headlight_render_test.c src/render.c src/render.h src/nfsu2.h

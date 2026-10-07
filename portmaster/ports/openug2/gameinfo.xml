@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./OpenUG2.sh</path>
+    <name>OpenUG2 (NFS Underground 2)</name>
+    <desc>An open-source reimplementation of the Need for Speed: Underground 2 engine. Bring your own copy of the game. Early prototype.</desc>
+    <releasedate>20261008T000000</releasedate>
+    <developer>OpenUG2 contributors</developer>
+    <publisher>Open Source</publisher>
+    <genre>Racing</genre>
+    <image>./openug2/screenshot.png</image>
+  </game>
+</gameList>
